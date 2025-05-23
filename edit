@@ -51,6 +51,167 @@ SERVICE_PREFIXES = [ # As per task description
     'dns', 'dns1', 'dns2', 'ns', 'ns1', 'ns2', 'smtp', 'pop', 'imap', 'admin', 'owa', 'portal'
 ]
 
+# --- Definition of perform_full_scan function ---
+def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_key, vd_api_key):
+    current_run_results = {}
+    dominio_for_report = target_input.strip()
+    current_run_results['original_target'] = dominio_for_report
+
+    # Write initial header to the provided file handle
+    main_report_file_handle.write(f"\n\n--- Resultados del Escaneo Detallado para '{dominio_for_report}' ---\n")
+
+    # Determine if input is an IP address or a hostname
+    is_ip_address_local = False
+    resolved_ip_local = None
+    target_ip_for_scan_local = ""
+
+    try:
+        socket.inet_aton(dominio_for_report)
+        is_ip_address_local = True
+    except socket.error:
+        pass
+
+    if is_ip_address_local:
+        print(f"Input '{dominio_for_report}' es una dirección IP.")
+        target_ip_for_scan_local = dominio_for_report
+    else:
+        print(f"Input '{dominio_for_report}' parece ser un nombre de host. Intentando resolución DNS...")
+        resolved_ip_local = get_dns_records(dominio_for_report) # Uses existing global get_dns_records
+        if not resolved_ip_local:
+            message = f"Error: Fallo en la resolución DNS para '{dominio_for_report}'. No se puede continuar el escaneo para este objetivo.\n"
+            print(message.strip())
+            main_report_file_handle.write(message)
+            current_run_results['is_ip_address_input'] = is_ip_address_local
+            current_run_results['resolved_ip'] = resolved_ip_local
+            current_run_results['target_ip_for_scan'] = None
+            main_report_file_handle.write(f"--- Fin del Escaneo Detallado para '{dominio_for_report}' (Fallo Temprano) ---\n\n")
+            return current_run_results # Return partially filled results
+
+        print(f"Nombre de host '{dominio_for_report}' resuelto a IP: {resolved_ip_local}")
+        target_ip_for_scan_local = resolved_ip_local
+
+    current_run_results['is_ip_address_input'] = is_ip_address_local
+    current_run_results['resolved_ip'] = resolved_ip_local
+    current_run_results['target_ip_for_scan'] = target_ip_for_scan_local
+
+    # Log DNS resolution details if input was a hostname
+    if not is_ip_address_local and resolved_ip_local:
+        main_report_file_handle.write(f"--- Resultados de la Resolución DNS para '{dominio_for_report}' ---\n")
+        main_report_file_handle.write(f"Nombre de host '{dominio_for_report}' resuelto a IP: {resolved_ip_local}\n")
+        main_report_file_handle.write("--- Fin de Resultados de la Resolución DNS ---\n\n")
+
+    # Subdomain search (only if the original input was not an IP)
+    all_discovered_subdomains_set_local = set()
+    subdomains_found_ct_results_local = []
+    subdomains_found_dns_results_local = []
+    potential_origin_ips_history_local = []
+    potential_origin_ips_services_local = []
+
+    if not is_ip_address_local:
+        print(f"\n--- Buscando subdominios para '{dominio_for_report}' vía crt.sh ---")
+        subdomains_found_ct_results_local = find_subdomains_ct(dominio_for_report)
+        if subdomains_found_ct_results_local:
+            for sub in subdomains_found_ct_results_local:
+                all_discovered_subdomains_set_local.add(sub)
+        main_report_file_handle.write(f"--- Resultados de Búsqueda de Subdominios (Certificate Transparency) para '{dominio_for_report}' ---\n")
+        if subdomains_found_ct_results_local:
+            for sub in subdomains_found_ct_results_local: main_report_file_handle.write(f"  - {sub}\n")
+        else: main_report_file_handle.write("No se encontraron subdominios vía Certificate Transparency.\n")
+        main_report_file_handle.write("--- Fin de la Búsqueda de Subdominios (crt.sh) ---\n\n")
+
+        print(f"\n--- Buscando subdominios comunes para '{dominio_for_report}' vía DNS ---")
+        subdomains_found_dns_results_local = find_subdomains_common_dns(dominio_for_report)
+        if subdomains_found_dns_results_local:
+            for sub_ip_pair in subdomains_found_dns_results_local:
+                try: subdomain_part = sub_ip_pair.split(' ')[0]; all_discovered_subdomains_set_local.add(subdomain_part)
+                except IndexError: pass
+        main_report_file_handle.write(f"--- Resultados de Búsqueda de Subdominios Comunes (DNS) para '{dominio_for_report}' ---\n")
+        if subdomains_found_dns_results_local:
+            for sub_ip_pair in subdomains_found_dns_results_local: main_report_file_handle.write(f"  - {sub_ip_pair}\n")
+        else: main_report_file_handle.write("No se encontraron subdominios comunes vía DNS directo.\n")
+        main_report_file_handle.write("--- Fin de la Búsqueda de Subdominios Comunes (DNS) ---\n\n")
+        
+        current_run_results['all_discovered_subdomains'] = sorted(list(all_discovered_subdomains_set_local))
+    else:
+        current_run_results['all_discovered_subdomains'] = []
+
+    # Cloudflare Check
+    print(f"\n--- Verificando Cloudflare para '{dominio_for_report}' ---")
+    cloudflare_results_local = check_cloudflare(dominio_for_report)
+    current_run_results['cloudflare_results'] = cloudflare_results_local
+    main_report_file_handle.write(f"--- Resultados de la Verificación de Cloudflare para '{dominio_for_report}' ---\n")
+    main_report_file_handle.write(f"¿Detrás de Cloudflare?: {'Sí' if cloudflare_results_local.get('is_cloudflare') else 'No'}\n")
+    if cloudflare_results_local.get('ip_addresses'): main_report_file_handle.write(f"IPs analizadas para Cloudflare: {', '.join(cloudflare_results_local['ip_addresses'])}\n")
+    if cloudflare_results_local.get('evidence'):
+        main_report_file_handle.write("Evidencia de Cloudflare:\n")
+        for ev in cloudflare_results_local['evidence']: main_report_file_handle.write(f"  - {ev}\n")
+    main_report_file_handle.write("--- Fin de Resultados de la Verificación de Cloudflare ---\n\n")
+
+    # Origin IP Search (if not IP)
+    consolidated_potential_origin_ips_set_local = set()
+    if not is_ip_address_local:
+        print(f"\n--- Buscando IPs de origen (historial DNS) para '{dominio_for_report}' vía SecurityTrails ---")
+        potential_origin_ips_history_local = find_origin_ip_dns_history(dominio_for_report, st_api_key)
+        main_report_file_handle.write(f"--- IPs de Origen Potenciales (Historial DNS - SecurityTrails) para '{dominio_for_report}' ---\n")
+        if potential_origin_ips_history_local:
+            for ip_hist in potential_origin_ips_history_local: main_report_file_handle.write(f"  - {ip_hist}\n")
+        else: main_report_file_handle.write("No se encontraron IPs de origen potenciales vía SecurityTrails o clave no provista.\n")
+        main_report_file_handle.write("--- Fin de Búsqueda de IPs de Origen (Historial DNS) ---\n\n")
+
+        print(f"\n--- Buscando IPs de origen (servicios relacionados DNS) para '{dominio_for_report}' ---")
+        potential_origin_ips_services_local = check_related_services_dns(dominio_for_report, subdomains_found_ct_results_local)
+        main_report_file_handle.write(f"--- IPs de Origen Potenciales (Servicios Relacionados DNS) para '{dominio_for_report}' ---\n")
+        if potential_origin_ips_services_local:
+            for ip_serv in potential_origin_ips_services_local: main_report_file_handle.write(f"  - {ip_serv}\n")
+        else: main_report_file_handle.write("No se encontraron IPs de origen potenciales vía servicios DNS relacionados.\n")
+        main_report_file_handle.write("--- Fin de Búsqueda de IPs de Origen (Servicios Relacionados DNS) ---\n\n")
+        
+        if cloudflare_results_local.get('is_cloudflare'):
+            if potential_origin_ips_history_local: consolidated_potential_origin_ips_set_local.update(potential_origin_ips_history_local)
+            if potential_origin_ips_services_local: consolidated_potential_origin_ips_set_local.update(potential_origin_ips_services_local)
+            main_report_file_handle.write(f"--- Lista Consolidada de IPs de Origen Potenciales (No Cloudflare) para '{dominio_for_report}' ---\n")
+            if consolidated_potential_origin_ips_set_local:
+                main_report_file_handle.write(f"Total de IPs de origen potenciales únicas encontradas: {len(consolidated_potential_origin_ips_set_local)}\n")
+                for ip_origin in sorted(list(consolidated_potential_origin_ips_set_local)): main_report_file_handle.write(f"  - {ip_origin}\n")
+            else: main_report_file_handle.write("No se encontraron IPs de origen potenciales.\n")
+            main_report_file_handle.write("--- Fin de Lista Consolidada de IPs de Origen ---\n\n")
+        else:
+            main_report_file_handle.write(f"--- Búsqueda de IP de Origen para '{dominio_for_report}' ---\n")
+            main_report_file_handle.write("Cloudflare no fue detectado, la búsqueda específica de IP de origen no fue realizada.\n")
+            main_report_file_handle.write("--- Fin de Búsqueda de IP de Origen ---\n\n")
+            
+    current_run_results['consolidated_potential_origin_ips'] = sorted(list(consolidated_potential_origin_ips_set_local))
+    
+    # VirusTotal and ViewDNS reports
+    current_run_results['virustotal_summary'] = get_virustotal_report(dominio_for_report, vt_api_key, main_report_file_handle)
+    current_run_results['viewdns_summary'] = get_viewdns_info(dominio_for_report, vd_api_key, main_report_file_handle)
+
+    # Ping Check
+    check_reachability_with_ping(target_ip_for_scan_local, main_report_file_handle)
+
+    # Port Scan
+    main_report_file_handle.write("--- Resultados del Escaneo de Puertos con Nmap ---\n")
+    open_ports_list_local = scan_ports(target_ip_for_scan_local)
+    current_run_results['open_ports'] = open_ports_list_local if open_ports_list_local else []
+    if open_ports_list_local:
+        main_report_file_handle.write(f"Puertos abiertos encontrados en {target_ip_for_scan_local}:\n")
+        for port in open_ports_list_local: main_report_file_handle.write(f"  {port}/tcp - Abierto\n")
+        
+        main_report_file_handle.write("\n--- Intentando obtener contenido HTTP de puertos abiertos ---\n")
+        paths_to_check = ["/", "/robots.txt", "/sitemap.xml"]
+        for port_num in open_ports_list_local:
+            if port_num == 80 or port_num == 443 or port_num >= 8000:
+                for path_segment in paths_to_check:
+                    fetch_http_content(target_ip_for_scan_local, port_num, path_segment, main_report_file_handle)
+    else:
+        main_report_file_handle.write(f"No se encontraron puertos abiertos o hubo un error durante el escaneo en {target_ip_for_scan_local}.\n")
+    main_report_file_handle.write("--- Fin de Resultados del Escaneo de Puertos ---\n\n")
+
+    main_report_file_handle.write(f"\nEscaneo detallado para '{dominio_for_report}' finalizado.\n")
+    main_report_file_handle.write(f"--- Fin del Escaneo Detallado para '{dominio_for_report}' ---\n\n")
+    return current_run_results
+# --- End of perform_full_scan function ---
+
 def find_subdomains_common_dns(target_domain):
     print(f"Buscando subdominios comunes para {target_domain} mediante resolución DNS directa...")
     resolved_subdomains = []
@@ -812,7 +973,7 @@ if __name__ == '__main__':
     scan_results = {} # Initialize scan_results dictionary
 
     ip_input = input("Ingrese la dirección IP o el dominio que desea escanear: ")
-    scan_results['original_target'] = ip_input.strip() # Populate after input
+    # scan_results['original_target'] = ip_input.strip() # This is now done in perform_full_scan or main
 
     # --- Configuration for Optional Features ---
     securitytrails_api_key = input("Enter your SecurityTrails API key (optional, press Enter to skip, default key will be used): ").strip()
@@ -844,277 +1005,38 @@ if __name__ == '__main__':
         sys.exit(1)
     
     target_ip_for_scan = ""
-    dominio_for_report = scan_results['original_target'] # Use value from scan_results
-
+    # dominio_for_report = scan_results['original_target'] # Now set inside perform_full_scan or based on ip_input
+    
     # Determine if input is an IP address or a hostname
-    is_ip_address = False # Default
-    resolved_ip = None # Default
-    target_ip_for_scan = "" # Default
-    try:
-        socket.inet_aton(dominio_for_report)  # Validates IPv4
-        is_ip_address = True
-    except socket.error:
-        # Not a valid IPv4 address, assume it's a hostname or invalid
-        # Further check for other IP formats (like IPv6) could be added here if needed
-        pass
-
-    if is_ip_address:
-        print(f"Input '{dominio_for_report}' es una dirección IP.")
-        target_ip_for_scan = dominio_for_report
-        resolved_ip = None # No DNS resolution needed for IP input itself
-    else: # Input is potentially a hostname
-        print(f"Input '{dominio_for_report}' parece ser un nombre de host. Intentando resolución DNS...")
-        resolved_ip = get_dns_records(dominio_for_report)
-        if not resolved_ip:
-            print(f"Error: Fallo en la resolución DNS para '{dominio_for_report}'. El script no puede continuar.")
-            sys.exit(1)
-        else:
-            print(f"Nombre de host '{dominio_for_report}' resuelto a IP: {resolved_ip}")
-            target_ip_for_scan = resolved_ip
+    # This initial determination is now primarily for the report filename and initial call.
+    # The perform_full_scan function will do its own determination based on its target_input.
     
-    # Proceed only if we have a valid target_ip_for_scan
-    if not target_ip_for_scan:
-        print("Error: No se pudo determinar una IP válida para escanear. Saliendo.")
-        scan_results['is_ip_address_input'] = is_ip_address
-        scan_results['resolved_ip'] = resolved_ip
-        scan_results['target_ip_for_scan'] = target_ip_for_scan
-        # Further scan_results population for early exit might be needed if script exits here
-        sys.exit(1)
-    
-    scan_results['is_ip_address_input'] = is_ip_address
-    scan_results['resolved_ip'] = resolved_ip
-    scan_results['target_ip_for_scan'] = target_ip_for_scan
-
-    # Subdomain search (only if the original input was not an IP)
-    # Initialize relevant keys in scan_results with defaults
-    scan_results['all_discovered_subdomains'] = []
-    subdomains_found_ct_results = [] 
-    subdomains_found_dns_results = [] 
-    potential_origin_ips_history = []
-    potential_origin_ips_services = []
-    all_discovered_subdomains_set = set() # Use a temporary set for discovery
-
-    if not is_ip_address: # Only search subdomains and DNS history if input was a domain name
-        print(f"\n--- Buscando subdominios para '{dominio_for_report}' vía crt.sh ---")
-        subdomains_found_ct_results = find_subdomains_ct(dominio_for_report)
-        if subdomains_found_ct_results:
-            print("Subdominios encontrados (crt.sh):")
-            for sub in subdomains_found_ct_results:
-                print(f"  - {sub}")
-                all_discovered_subdomains_set.add(sub) # Add to the set for deduplication
-        else:
-            print(f"No se encontraron subdominios para '{dominio_for_report}' vía crt.sh.")
-        print("--- Fin de la búsqueda de subdominios vía crt.sh ---\n")
-
-        print(f"\n--- Buscando subdominios comunes para '{dominio_for_report}' vía DNS ---")
-        subdomains_found_dns_results = find_subdomains_common_dns(dominio_for_report)
-        if subdomains_found_dns_results:
-            print("Subdominios comunes encontrados (DNS):")
-            for sub_ip_pair in subdomains_found_dns_results:
-                print(f"  - {sub_ip_pair}")
-                try:
-                    # Extract just the domain part for the consolidated list
-                    subdomain_part = sub_ip_pair.split(' ')[0]
-                    all_discovered_subdomains_set.add(subdomain_part)
-                except IndexError:
-                    print(f"Advertencia: No se pudo extraer el subdominio de '{sub_ip_pair}'")
-        else:
-            print(f"No se encontraron subdominios comunes para '{dominio_for_report}' vía DNS.")
-        print("--- Fin de la búsqueda de subdominios comunes vía DNS ---\n")
-
-        # Find potential origin IPs from DNS history
-        print(f"\n--- Buscando IPs de origen (historial DNS) para '{dominio_for_report}' vía SecurityTrails ---")
-        # Pass the user-provided or default API key
-        potential_origin_ips_history = find_origin_ip_dns_history(dominio_for_report, securitytrails_api_key) 
-        if potential_origin_ips_history:
-            print(f"IPs de origen potenciales (no Cloudflare) encontradas para '{dominio_for_report}': {potential_origin_ips_history}")
-        else:
-            print(f"No se encontraron IPs de origen potenciales (no Cloudflare) para '{dominio_for_report}' vía SecurityTrails.")
-        print("--- Fin de la búsqueda de IPs de origen (historial DNS) ---\n")
-
-        # Find potential origin IPs from related services DNS
-        print(f"\n--- Buscando IPs de origen (servicios relacionados DNS) para '{dominio_for_report}' ---")
-        # Pass subdomains_found_ct_results in case it's useful in a more advanced version, though not used now
-        potential_origin_ips_services = check_related_services_dns(dominio_for_report, subdomains_found_ct_results) 
-        if potential_origin_ips_services:
-            print(f"IPs de origen potenciales (no Cloudflare) de servicios DNS relacionados para '{dominio_for_report}': {potential_origin_ips_services}")
-        else:
-            print(f"No se encontraron IPs de origen potenciales (no Cloudflare) para '{dominio_for_report}' vía servicios DNS relacionados.")
-        print("--- Fin de la búsqueda de IPs de origen (servicios relacionados DNS) ---\n")
-        scan_results['all_discovered_subdomains'] = sorted(list(all_discovered_subdomains_set)) # Populate here
-    
-    # Check for Cloudflare
-    # This check is performed for both IP and domain inputs.
-    print(f"\n--- Verificando Cloudflare para '{dominio_for_report}' ---")
-    cloudflare_results = check_cloudflare(dominio_for_report)
-    scan_results['cloudflare_results'] = cloudflare_results # Populate here
-    print(f"Resultado de la verificación de Cloudflare: {'Sí' if cloudflare_results['is_cloudflare'] else 'No'}")
-    if cloudflare_results['evidence']:
-        print("Evidencia de Cloudflare:")
-        for ev in cloudflare_results['evidence']:
-            print(f"  - {ev}")
-    print("--- Fin de la Verificación de Cloudflare ---\n")
-
-    # If Cloudflare is detected and input was a domain, try to find origin IPs
-    consolidated_potential_origin_ips_set = set()
-    if not is_ip_address and cloudflare_results.get('is_cloudflare'):
-        print("\n[INFO] Cloudflare detectado. Intentando encontrar IPs de origen...")
-        if potential_origin_ips_history: # Already a list
-            consolidated_potential_origin_ips_set.update(potential_origin_ips_history)
-        if potential_origin_ips_services: # Already a list
-            consolidated_potential_origin_ips_set.update(potential_origin_ips_services)
-        
-        if consolidated_potential_origin_ips_set:
-            print(f"\n[INFO] IPs de origen potenciales consolidadas (no Cloudflare): {sorted(list(consolidated_potential_origin_ips_set))}")
-        else:
-            print("\n[INFO] No se encontraron IPs de origen potenciales adicionales a través de historial DNS o servicios relacionados.")
-    elif not is_ip_address and not cloudflare_results.get('is_cloudflare'):
-        print("\n[INFO] Cloudflare no detectado. La búsqueda de IP de origen específica para Cloudflare no es necesaria.")
-    elif is_ip_address and cloudflare_results.get('is_cloudflare'):
-         print("\n[INFO] Cloudflare detectado, pero el objetivo es una IP. La búsqueda de IP de origen no aplica directamente.")
-    else: # IP input, no Cloudflare
-        print("\n[INFO] Cloudflare no detectado para la IP proporcionada.")
-    scan_results['consolidated_potential_origin_ips'] = sorted(list(consolidated_potential_origin_ips_set)) # Populate here
-
-
-    # Sanitize the original input (domain or IP) for use in the main report filename
-    safe_report_name_base = re.sub(r'[^\w\.-]', '_', dominio_for_report)
+    safe_report_name_base = re.sub(r'[^\w\.-]', '_', ip_input.strip())
     nombre_archivo_reporte_principal = f"reporte_{safe_report_name_base}.txt"
-    scan_results['report_file_name'] = nombre_archivo_reporte_principal # Populate here
     print(f"El informe principal se guardará en: {nombre_archivo_reporte_principal}")
+    scan_results['report_file_name'] = nombre_archivo_reporte_principal # Set once
 
     try:
         with open(nombre_archivo_reporte_principal, 'w', encoding='utf-8') as f_reporte_principal:
-            f_reporte_principal.write(f"Resultados del escaneo para '{dominio_for_report}' (IP escaneada: {target_ip_for_scan}):\n\n")
-
-            # Log DNS resolution details if input was a hostname
-            if not is_ip_address and resolved_ip:
-                f_reporte_principal.write(f"--- Resultados de la Resolución DNS para '{dominio_for_report}' ---\n")
-                f_reporte_principal.write(f"Nombre de host '{dominio_for_report}' resuelto a IP: {resolved_ip}\n")
-                f_reporte_principal.write("--- Fin de Resultados de la Resolución DNS ---\n\n")
-
-            # Log Cloudflare check results to the main report
-            f_reporte_principal.write(f"--- Resultados de la Verificación de Cloudflare para '{dominio_for_report}' ---\n")
-            f_reporte_principal.write(f"¿Detrás de Cloudflare?: {'Sí' if cloudflare_results['is_cloudflare'] else 'No'}\n")
-            if cloudflare_results['ip_addresses']:
-                 f_reporte_principal.write(f"IPs analizadas para Cloudflare: {', '.join(cloudflare_results['ip_addresses'])}\n")
-            if cloudflare_results['evidence']:
-                f_reporte_principal.write("Evidencia de Cloudflare:\n")
-                for ev in cloudflare_results['evidence']:
-                    f_reporte_principal.write(f"  - {ev}\n")
-            f_reporte_principal.write("--- Fin de Resultados de la Verificación de Cloudflare ---\n\n")
-
-            # Log Subdomain search results to the main report
-            if not is_ip_address: # Only attempt to log if domain was the input
-                # Log results from Certificate Transparency
-                f_reporte_principal.write(f"--- Resultados de Búsqueda de Subdominios (Certificate Transparency) para '{dominio_for_report}' ---\n")
-                if subdomains_found_ct_results:
-                    for sub in subdomains_found_ct_results:
-                        f_reporte_principal.write(f"  - {sub}\n")
-                else:
-                    f_reporte_principal.write("No se encontraron subdominios vía Certificate Transparency.\n")
-                f_reporte_principal.write("--- Fin de la Búsqueda de Subdominios (crt.sh) ---\n\n")
-
-                # Log results from Common DNS Brute-force
-                f_reporte_principal.write(f"--- Resultados de Búsqueda de Subdominios Comunes (DNS) para '{dominio_for_report}' ---\n")
-                if subdomains_found_dns_results:
-                    for sub_ip_pair in subdomains_found_dns_results:
-                        f_reporte_principal.write(f"  - {sub_ip_pair}\n") # Log with IP for this section
-                else:
-                    f_reporte_principal.write("No se encontraron subdominios comunes vía DNS directo.\n")
-                f_reporte_principal.write("--- Fin de la Búsqueda de Subdominios Comunes (DNS) ---\n\n")
-
-                # Log potential origin IPs from DNS history
-                f_reporte_principal.write(f"--- IPs de Origen Potenciales (Historial DNS - SecurityTrails) para '{dominio_for_report}' ---\n")
-                if potential_origin_ips_history:
-                    for ip_hist in potential_origin_ips_history:
-                        f_reporte_principal.write(f"  - {ip_hist}\n")
-                else:
-                    f_reporte_principal.write("No se encontraron IPs de origen potenciales (no Cloudflare) vía SecurityTrails, o la comprobación fue omitida (sin API key).\n")
-                f_reporte_principal.write("--- Fin de Búsqueda de IPs de Origen (Historial DNS) ---\n\n")
-
-                # Log potential origin IPs from related services DNS
-                f_reporte_principal.write(f"--- IPs de Origen Potenciales (Servicios Relacionados DNS) para '{dominio_for_report}' ---\n")
-                if potential_origin_ips_services:
-                    for ip_serv in potential_origin_ips_services:
-                        f_reporte_principal.write(f"  - {ip_serv}\n")
-                else:
-                    f_reporte_principal.write("No se encontraron IPs de origen potenciales (no Cloudflare) vía servicios DNS relacionados.\n")
-                f_reporte_principal.write("--- Fin de Búsqueda de IPs de Origen (Servicios Relacionados DNS) ---\n\n")
-
-                # Consolidated Origin IPs (if Cloudflare was detected)
-                if cloudflare_results.get('is_cloudflare'):
-                    f_reporte_principal.write(f"--- Lista Consolidada de IPs de Origen Potenciales (No Cloudflare) para '{dominio_for_report}' ---\n")
-                    # Use scan_results for writing to report
-                    if scan_results['consolidated_potential_origin_ips']:
-                        f_reporte_principal.write(f"Total de IPs de origen potenciales únicas encontradas: {len(scan_results['consolidated_potential_origin_ips'])}\n")
-                        for ip_origin in scan_results['consolidated_potential_origin_ips']:
-                            f_reporte_principal.write(f"  - {ip_origin} (Candidata para investigación adicional)\n")
-                    else:
-                        f_reporte_principal.write("No se encontraron IPs de origen potenciales (no Cloudflare) a través de los métodos combinados.\n")
-                    f_reporte_principal.write("--- Fin de Lista Consolidada de IPs de Origen ---\n\n")
-                else:
-                    f_reporte_principal.write(f"--- Búsqueda de IP de Origen para '{dominio_for_report}' ---\n")
-                    f_reporte_principal.write("Cloudflare no fue detectado, por lo que la búsqueda específica de IP de origen no fue realizada.\n")
-                    f_reporte_principal.write("--- Fin de Búsqueda de IP de Origen ---\n\n")
-            
-            # Call VirusTotal after SecurityTrails and other DNS info, before consolidated lists
-            scan_results['virustotal_summary'] = get_virustotal_report(dominio_for_report, virustotal_api_key, f_reporte_principal)
-            
-            # Call ViewDNS
-            scan_results['viewdns_summary'] = get_viewdns_info(dominio_for_report, viewdns_api_key, f_reporte_principal)
-                
-            if not is_ip_address: # This block was specific to non-IP inputs for subdomains
-                # Now the consolidated list of subdomains
-                # Use scan_results for writing to report
-                f_reporte_principal.write(f"--- Lista Consolidada de Subdominios Únicos Descubiertos para '{dominio_for_report}' ---\n")
-                if scan_results['all_discovered_subdomains']:
-                    f_reporte_principal.write(f"Total de subdominios únicos encontrados (crt.sh + DNS común): {len(scan_results['all_discovered_subdomains'])}\n")
-                    for sub in scan_results['all_discovered_subdomains']:
-                        f_reporte_principal.write(f"  - {sub}\n")
-                    print(f"\n[INFO] Se encontraron {len(scan_results['all_discovered_subdomains'])} subdominios únicos para {dominio_for_report} (excluyendo IPs de historial).")
-                else:
-                    f_reporte_principal.write(f"No se descubrieron subdominios adicionales para '{dominio_for_report}' a través de los métodos de enumeración.\n")
-                    print(f"\n[INFO] No se descubrieron subdominios adicionales para '{dominio_for_report}'.")
-                f_reporte_principal.write("--- Fin de Lista Consolidada de Subdominios ---\n\n")
-            
-            # Check reachability with ping
-            check_reachability_with_ping(target_ip_for_scan, f_reporte_principal)
-            
-            # Perform Nmap port scan
-            f_reporte_principal.write("--- Resultados del Escaneo de Puertos con Nmap ---\n")
-            open_ports_list = scan_ports(target_ip_for_scan) # Use new local variable
-            scan_results['open_ports'] = [] # Default to empty list
-
-            if open_ports_list:
-                scan_results['open_ports'] = open_ports_list # Populate with actual results
-                f_reporte_principal.write(f"Puertos abiertos encontrados en {target_ip_for_scan}:\n")
-                for port in open_ports_list: # Use local variable for iteration
-                    f_reporte_principal.write(f"  {port}/tcp - Abierto\n")
-                print(f"Puertos abiertos en {target_ip_for_scan} (objetivo original: {dominio_for_report}): {open_ports_list}")
-                
-                # Fetch HTTP content from common web ports found open
-                f_reporte_principal.write("\n--- Intentando obtener contenido HTTP de puertos abiertos ---\n")
-                paths_to_check = ["/", "/robots.txt", "/sitemap.xml"] # Common paths
-                for port_num in open_ports_list: # Use local variable for iteration
-                    if port_num == 80 or port_num == 443 or port_num >= 8000: 
-                        for path_segment in paths_to_check:
-                            print(f"Intentando obtener contenido HTTP de {target_ip_for_scan}:{port_num}{path_segment} (para {dominio_for_report})...")
-                            fetch_http_content(target_ip_for_scan, port_num, path_segment, f_reporte_principal)
+            # Call perform_full_scan for the initial target
+            initial_scan_data = perform_full_scan(ip_input, f_reporte_principal, securitytrails_api_key, virustotal_api_key, viewdns_api_key)
+            if initial_scan_data:
+                scan_results.update(initial_scan_data) # Populate global scan_results
             else:
-                # scan_results['open_ports'] is already []
-                message = f"No se encontraron puertos abiertos o hubo un error durante el escaneo en {target_ip_for_scan} (objetivo original: {dominio_for_report}).\n"
-                f_reporte_principal.write(message)
-                print(message.strip())
-            f_reporte_principal.write("--- Fin de Resultados del Escaneo de Puertos ---\n\n")
-            
-            f_reporte_principal.write(f"\nEscaneo finalizado. Creado por @kristoteve.\n")
+                print(f"El escaneo inicial para {ip_input} falló gravemente.")
+                # Ensure scan_results has at least the basic info for display_scan_findings
+                if 'original_target' not in scan_results: scan_results['original_target'] = ip_input.strip()
+                # Other keys will be missing or have defaults from perform_full_scan's partial return
         
-        print(f"Escaneo completado. Resultados guardados en {nombre_archivo_reporte_principal}")
+        print(f"Escaneo inicial completado. Resultados guardados en {nombre_archivo_reporte_principal}")
 
     except IOError as e:
         print(f"Error crítico de E/S al manejar el archivo de reporte principal {nombre_archivo_reporte_principal}: {e}")
         print("No se pudieron guardar los resultados del reporte principal.")
+        # Initialize essential scan_results keys if file operations failed early
+        if 'original_target' not in scan_results: scan_results['original_target'] = ip_input.strip()
+        if 'report_file_name' not in scan_results: scan_results['report_file_name'] = nombre_archivo_reporte_principal
+
 
     # Placeholder for functions mentioned in the problem description context (if they were to be integrated)
     # def get_server_info(ip):
@@ -1140,20 +1062,74 @@ if __name__ == '__main__':
             # Aquí se llamará a la función para seleccionar IP (Paso 8)
             # Ejemplo: select_ip_for_actions(scan_results)
         elif choice == '3':
-            print("\nDEBUG: Opción 3 seleccionada - Obtener reporte VirusTotal...")
-            # Aquí se llamará a la función para VirusTotal (Paso 11)
-            # Ejemplo: interactive_virustotal_lookup(scan_results)
+            print("\n--- Obtener Reporte de VirusTotal ---")
+            resource_vt = input("Ingrese la IP o Dominio para consultar en VirusTotal: ").strip()
+            if not resource_vt:
+                print("No se ingresó IP o Dominio.")
+            else:
+                report_file_name_vt = scan_results.get('report_file_name')
+                if report_file_name_vt and virustotal_api_key:
+                    try:
+                        with open(report_file_name_vt, 'a', encoding='utf-8') as f_reporte_interactive:
+                            f_reporte_interactive.write(f"\n--- Reporte VirusTotal Interactivo para '{resource_vt}' (Sesión Interactiva) ---\n")
+                            get_virustotal_report(resource_vt, virustotal_api_key, f_reporte_interactive) # This function now writes to the file handle
+                            f_reporte_interactive.write(f"--- Fin de Reporte VirusTotal Interactivo para '{resource_vt}' ---\n\n")
+                        print(f"Consulta a VirusTotal para '{resource_vt}' completada. Resultados añadidos al reporte principal.")
+                    except IOError as e:
+                        print(f"Error al escribir en el archivo de reporte ({report_file_name_vt}): {e}")
+                elif not report_file_name_vt:
+                    print("Advertencia: No se encontró el nombre del archivo de reporte para registrar esta acción.")
+                else: # API key missing
+                    print("Advertencia: La clave API de VirusTotal no está disponible.")
         elif choice == '4':
-            print("\nDEBUG: Opción 4 seleccionada - Obtener info ViewDNS...")
-            # Aquí se llamará a la función para ViewDNS (Paso 12)
-            # Ejemplo: interactive_viewdns_lookup(scan_results)
+            print("\n--- Obtener Información de ViewDNS ---")
+            resource_vd = input("Ingrese la IP o Dominio para consultar en ViewDNS: ").strip()
+            if not resource_vd:
+                print("No se ingresó IP o Dominio.")
+            else:
+                report_file_name_vd = scan_results.get('report_file_name')
+                if report_file_name_vd and viewdns_api_key:
+                    try:
+                        with open(report_file_name_vd, 'a', encoding='utf-8') as f_reporte_interactive:
+                            f_reporte_interactive.write(f"\n--- Información ViewDNS Interactiva para '{resource_vd}' (Sesión Interactiva) ---\n")
+                            get_viewdns_info(resource_vd, viewdns_api_key, f_reporte_interactive) # This function now writes to the file handle
+                            f_reporte_interactive.write(f"--- Fin de Información ViewDNS Interactiva para '{resource_vd}' ---\n\n")
+                        print(f"Consulta a ViewDNS para '{resource_vd}' completada. Resultados añadidos al reporte principal.")
+                    except IOError as e:
+                        print(f"Error al escribir en el archivo de reporte ({report_file_name_vd}): {e}")
+                elif not report_file_name_vd:
+                     print("Advertencia: No se encontró el nombre del archivo de reporte para registrar esta acción.")
+                else: # API key missing
+                    print("Advertencia: La clave API de ViewDNS no está disponible.")
         elif choice == '5':
-            print("\nDEBUG: Opción 5 seleccionada - Escanear nuevo objetivo...")
-            # Aquí se llamará a la función para escanear nuevo objetivo (Paso 13)
-            # print("Esta función reiniciará el script o solicitará un nuevo objetivo.")
-            # Consider how to handle re-scanning; might involve re-running main logic or parts of it.
-            # For now, just a placeholder.
-            print("Funcionalidad de re-escaneo aún no implementada en modo interactivo.")
+            print("\n--- Escanear Nuevo Objetivo ---")
+            new_target_input = input("Ingrese la nueva IP o Dominio a escanear: ").strip()
+            if not new_target_input:
+                print("No se ingresó nuevo objetivo.")
+            else:
+                report_file = scan_results.get('report_file_name') # Usar el mismo archivo de reporte
+                if report_file:
+                    print(f"Iniciando nuevo escaneo para '{new_target_input}'. Los resultados se añadirán a {report_file}")
+                    try:
+                        with open(report_file, 'a', encoding='utf-8') as f_reporte_interactive:
+                            f_reporte_interactive.write(f"\n\n=== INICIO DE NUEVO ESCANEO INTERACTIVO PARA: {new_target_input} ===\n")
+                            # Usar las mismas claves API que al inicio
+                            new_scan_data = perform_full_scan(new_target_input, f_reporte_interactive, securitytrails_api_key, virustotal_api_key, viewdns_api_key)
+                            if new_scan_data:
+                                # Actualizar scan_results globales para reflejar el último escaneo
+                                scan_results.update(new_scan_data) 
+                                # También es importante actualizar el 'original_target', 'resolved_ip', etc. en scan_results
+                                # para que 'Listar hallazgos' muestre la info del *nuevo* target.
+                                scan_results['original_target'] = new_target_input 
+                                # (perform_full_scan debería haber llenado los otros campos como resolved_ip, target_ip_for_scan en new_scan_data)
+                                print(f"Nuevo escaneo para '{new_target_input}' completado. 'Listar todos los hallazgos' ahora mostrará estos resultados.")
+                            else:
+                                print(f"El nuevo escaneo para '{new_target_input}' no pudo completarse.")
+                            f_reporte_interactive.write(f"\n=== FIN DE NUEVO ESCANEO INTERACTIVO PARA: {new_target_input} ===\n")
+                    except IOError as e:
+                        print(f"Error al abrir o escribir en el archivo de reporte {report_file}: {e}")
+                else:
+                    print("Error: No se pudo determinar el archivo de reporte para el nuevo escaneo.")
         elif choice == '6':
             print("\nSaliendo del modo interactivo...")
             break  # Termina el bucle
