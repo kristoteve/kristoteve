@@ -9,6 +9,8 @@ Dependencies:
   - nmap: Must be installed and accessible via system PATH.
   - requests: Python library (install via pip: pip install requests).
   - dnspython: Python library (install via pip: pip install dnspython).
+  - beautifulsoup4: Python library (install via pip: pip install beautifulsoup4).
+  - lxml: Python library (install via pip: pip install lxml).
 """
 import os
 import subprocess
@@ -18,9 +20,11 @@ import re
 import sys
 import ipaddress
 import json
+from datetime import datetime # For potential date formatting from scraped data
 
-import dns.resolver # Added for this function
+import dns.resolver 
 import requests
+from bs4 import BeautifulSoup # Added for web scraping
 
 # --- Sanitization Function ---
 def sanitize_filename(name: str) -> str:
@@ -582,229 +586,203 @@ def check_related_services_dns(target_domain, subdomains_found=None):
 # MODIFIED SIGNATURE: Takes output_file_path instead of report_file_handle
 def get_virustotal_report(resource, api_key, output_file_path):
     print(f"\n--- Obteniendo reporte de VirusTotal para '{resource}' ---")
-    # console_summary_message will be returned for display in the main console
     console_summary_message = f"  Resumen de VirusTotal para '{resource}':\n"
+    web_scraping_summary_message = "  Web scraping para datos de relaciones detalladas: No intentado.\n" # Default
+    gui_link_relations = "" 
+    is_ip = False 
 
     try:
+        ipaddress.ip_address(resource)
+        is_ip = True
+    except ValueError:
+        pass
+
+    if is_ip:
+        gui_link_relations = f"https://www.virustotal.com/gui/ip-address/{resource}/relations"
+    else: 
+        gui_link_relations = f"https://www.virustotal.com/gui/domain/{resource}/relations"
+
+    # --- API Data Fetching (Primary) ---
+    try:
         with open(output_file_path, 'w', encoding='utf-8') as f_vt_report:
-            f_vt_report.write(f"--- Resultados de VirusTotal para '{resource}' ---\n")
+            f_vt_report.write(f"--- Resultados de VirusTotal para '{resource}' (Datos API) ---\n")
 
             if not api_key:
-                message = "  API key de VirusTotal no proporcionada. Omitiendo esta comprobación.\n"
-                print(message.strip())
+                message = "  API key de VirusTotal no proporcionada. Omitiendo esta comprobación API.\n"
                 f_vt_report.write(message + "\n")
-                # Still add to console summary that it was skipped
-                console_summary_message += message.strip() + " (Reporte detallado en archivo indica lo mismo).\n"
-                return console_summary_message 
+                console_summary_message += message.strip()
+            else:
+                base_url = "https://www.virustotal.com/api/v3/"
+                headers_api = {"x-apikey": api_key, "User-Agent": "Python Security Scanner Script/1.0"}
+                
+                url_api = f"{base_url}ip_addresses/{resource}" if is_ip else f"{base_url}domains/{resource}"
 
-            base_url = "https://www.virustotal.com/api/v3/"
-            headers = {"x-apikey": api_key, "User-Agent": "Python Security Scanner Script/1.0"}
+                try:
+                    response_main = requests.get(url_api, headers=headers_api, timeout=20)
+                    response_main.raise_for_status()
+                    data = response_main.json().get('data', {})
+                    attributes = data.get('attributes', {})
+
+                    if not attributes:
+                        message = f"  No se encontraron atributos en la respuesta API de VirusTotal para '{resource}'.\n"
+                        f_vt_report.write(message + "\n")
+                        console_summary_message += message
+                    else:
+                        stats = attributes.get('last_analysis_stats', {})
+                        malicious = stats.get('malicious', 0)
+                        suspicious = stats.get('suspicious', 0)
+                        harmless = stats.get('harmless', 0)
+                        undetected = stats.get('undetected', 0)
+                        basic_summary_part = (
+                            f"  Maliciosos (API): {malicious}\n"
+                            f"  Sospechosos (API): {suspicious}\n"
+                            f"  Inofensivos (API): {harmless}\n"
+                            f"  No detectados (API): {undetected}\n"
+                            f"  Enlace a GUI Relaciones: {gui_link_relations}\n"
+                        )
+                        f_vt_report.write(basic_summary_part + "\n")
+                        console_summary_message += basic_summary_part
+                
+                except requests.exceptions.HTTPError as e_http:
+                    error_message_http = f"  Error HTTP API: {e_http.response.status_code} {e_http.response.reason}.\n"
+                    f_vt_report.write(error_message_http + "\n")
+                    console_summary_message += error_message_http
+                except requests.exceptions.RequestException as e_req:
+                    error_message_req = f"  Error de red (API): {type(e_req).__name__}.\n"
+                    f_vt_report.write(error_message_req + "\n")
+                    console_summary_message += error_message_req
+                except json.JSONDecodeError as e_json_main:
+                    error_message_json = f"  Error al decodificar JSON de API VirusTotal: {e_json_main}.\n"
+                    f_vt_report.write(error_message_json + "\n")
+                    console_summary_message += error_message_json
             
-            is_ip = False
-            try:
-                ipaddress.ip_address(resource)
-                is_ip = True
-            except ValueError:
-                pass
+            f_vt_report.write("--- Fin de Resultados de VirusTotal (Datos API) ---\n\n")
 
-            if is_ip:
-                url = f"{base_url}ip_addresses/{resource}"
-                gui_link = f"https://www.virustotal.com/gui/ip-address/{resource}/relations"
-            else: # Domain
-                url = f"{base_url}domains/{resource}"
-                gui_link = f"https://www.virustotal.com/gui/domain/{resource}/relations"
-
-            try:
-                response_main = requests.get(url, headers=headers, timeout=20)
-                response_main.raise_for_status()
-                data = response_main.json().get('data', {})
-                attributes = data.get('attributes', {})
-
-                if not attributes:
-                    message = f"  No se encontraron atributos en la respuesta de VirusTotal para '{resource}'.\n"
-                    print(message.strip())
-                    f_vt_report.write(message + "\n")
-                    console_summary_message += message
-                    # Early return of summary if no attributes found
-                    f_vt_report.write("--- Fin de Resultados de VirusTotal ---\n\n")
-                    return console_summary_message
-
-                stats = attributes.get('last_analysis_stats', {})
-                malicious = stats.get('malicious', 0)
-                suspicious = stats.get('suspicious', 0)
-                harmless = stats.get('harmless', 0)
-                undetected = stats.get('undetected', 0)
-
-                basic_summary_part = (
-                    f"  Maliciosos: {malicious}\n"
-                    f"  Sospechosos: {suspicious}\n"
-                    f"  Inofensivos: {harmless}\n"
-                    f"  No detectados: {undetected}\n"
-                    f"  Enlace al reporte completo (GUI): {gui_link}\n"
-                )
-                print(basic_summary_part.strip())
-                f_vt_report.write(basic_summary_part + "\n")
-                console_summary_message += basic_summary_part
-
-                if is_ip:
-                    ip_resolutions_summary_part_for_console = ""
-                    resolutions_url = f"{base_url}ip_addresses/{resource}/resolutions"
-                    resolutions_report_part_for_file = f"--- Passive DNS Replication (Resolutions) for IP '{resource}' ---\n"
-                    current_resolutions_console_summary = "  Passive DNS Replication (Resolutions):\n"
-                    try:
-                        resolutions_response = requests.get(resolutions_url, headers=headers, timeout=20)
-                        resolutions_response.raise_for_status()
-                        resolutions_data = resolutions_response.json().get('data', [])
-                        if resolutions_data:
-                            resolutions_report_part_for_file += "  Hostnames que resolvieron a esta IP:\n"
-                            found_resolutions = []
-                            for entry in resolutions_data:
-                                attrs_res = entry.get('attributes', {})
-                                host = attrs_res.get('host_name', 'N/A')
-                                date_ts = attrs_res.get('date')
-                                entry_txt = f"    - {host} (Última resolución registrada: {date_ts})\n"
-                                if host != 'N/A':
-                                    resolutions_report_part_for_file += entry_txt
-                                    found_resolutions.append(entry_txt)
-                            if found_resolutions:
-                                for res_txt_cs in found_resolutions: current_resolutions_console_summary += res_txt_cs
-                            else:
-                                no_data_msg_res = "  No se encontraron nombres de host válidos en los datos de resoluciones.\n"
-                                resolutions_report_part_for_file += no_data_msg_res
-                                current_resolutions_console_summary += no_data_msg_res
-                        else:
-                            no_data_msg_res = f"  No se encontraron datos de resoluciones (Passive DNS) para la IP '{resource}'.\n"
-                            resolutions_report_part_for_file += no_data_msg_res
-                            current_resolutions_console_summary += no_data_msg_res
-                    except requests.exceptions.RequestException as e_res_ip:
-                        err_msg_res_ip = f"  Error al obtener resoluciones para la IP '{resource}': {type(e_res_ip).__name__}.\n"
-                        resolutions_report_part_for_file += err_msg_res_ip
-                        current_resolutions_console_summary += err_msg_res_ip
-                        print(err_msg_res_ip.strip())
-                    finally:
-                        f_vt_report.write(resolutions_report_part_for_file + "\n")
-                        ip_resolutions_summary_part_for_console = current_resolutions_console_summary
-                        console_summary_message += ip_resolutions_summary_part_for_console
-                else: # It's a domain
-                    passive_dns_summary_part_for_console = ""
-                    passive_dns_url = f"{base_url}domains/{resource}/passive_dns"
-                    passive_dns_report_part_for_file = "--- Passive DNS Replication ---\n"
-                    current_passive_dns_console_summary = "  Passive DNS Replication:\n"
-                    try:
-                        passive_dns_resp = requests.get(passive_dns_url, headers=headers, timeout=20)
-                        passive_dns_resp.raise_for_status()
-                        passive_dns_data_list = passive_dns_resp.json().get('data', [])
-                        if passive_dns_data_list:
-                            passive_dns_report_part_for_file += "  IPs Históricas (Passive DNS):\n"
-                            found_pdns_ips_list = []
-                            for item in passive_dns_data_list:
-                                ip_val = item.get('attributes', {}).get('ip_address', 'N/A')
-                                if ip_val != 'N/A':
-                                    passive_dns_report_part_for_file += f"    - {ip_val}\n"
-                                    found_pdns_ips_list.append(ip_val)
-                            if found_pdns_ips_list:
-                                for ip_val_cs in found_pdns_ips_list: current_passive_dns_console_summary += f"    - {ip_val_cs}\n"
-                            else:
-                                no_data_msg_pdns = "  No se encontraron IPs válidas en los datos de Passive DNS.\n"
-                                passive_dns_report_part_for_file += no_data_msg_pdns
-                                current_passive_dns_console_summary += no_data_msg_pdns
-                        else:
-                            no_data_msg_pdns = "  No se encontraron datos de Passive DNS.\n"
-                            passive_dns_report_part_for_file += no_data_msg_pdns
-                            current_passive_dns_console_summary += no_data_msg_pdns
-                    except requests.exceptions.RequestException as e_pdns_dom:
-                        err_msg_pdns_dom = f"  Error al obtener Passive DNS para '{resource}': {type(e_pdns_dom).__name__}.\n"
-                        passive_dns_report_part_for_file += err_msg_pdns_dom
-                        current_passive_dns_console_summary += err_msg_pdns_dom
-                        print(err_msg_pdns_dom.strip())
-                    finally:
-                        f_vt_report.write(passive_dns_report_part_for_file + "\n")
-                        passive_dns_summary_part_for_console = current_passive_dns_console_summary
-                        console_summary_message += passive_dns_summary_part_for_console
-
-                    siblings_summary_part_for_console = ""
-                    siblings_url = f"{base_url}domains/{resource}/subdomains"
-                    siblings_report_part_for_file = "--- Subdominios (Siblings) ---\n"
-                    current_siblings_console_summary = "  Subdominios (Siblings):\n"
-                    try:
-                        siblings_resp = requests.get(siblings_url, headers=headers, timeout=20)
-                        siblings_resp.raise_for_status()
-                        siblings_data_list = siblings_resp.json().get('data', [])
-                        if siblings_data_list:
-                            siblings_report_part_for_file += "  Subdominios Encontrados:\n"
-                            found_subdomains_list = []
-                            for item_sibl in siblings_data_list:
-                                sub_id = item_sibl.get('id', 'N/A')
-                                if sub_id != 'N/A':
-                                    siblings_report_part_for_file += f"    - {sub_id}\n"
-                                    found_subdomains_list.append(sub_id)
-                            if found_subdomains_list:
-                                for sub_id_cs in found_subdomains_list: current_siblings_console_summary += f"    - {sub_id_cs}\n"
-                            else:
-                                no_data_msg_sibl = "  No se encontraron IDs de subdominios válidos.\n"
-                                siblings_report_part_for_file += no_data_msg_sibl
-                                current_siblings_console_summary += no_data_msg_sibl
-                        else:
-                            no_data_msg_sibl = "  No se encontraron subdominios.\n"
-                            siblings_report_part_for_file += no_data_msg_sibl
-                            current_siblings_console_summary += no_data_msg_sibl
-                    except requests.exceptions.RequestException as e_sibl_dom:
-                        err_msg_sibl_dom = f"  Error al obtener subdominios para '{resource}': {type(e_sibl_dom).__name__}.\n"
-                        siblings_report_part_for_file += err_msg_sibl_dom
-                        current_siblings_console_summary += err_msg_sibl_dom
-                        print(err_msg_sibl_dom.strip())
-                    finally:
-                        f_vt_report.write(siblings_report_part_for_file + "\n")
-                        siblings_summary_part_for_console = current_siblings_console_summary
-                        console_summary_message += siblings_summary_part_for_console
-            
-            except requests.exceptions.HTTPError as e_http:
-                error_message_http = ""
-                if e_http.response.status_code == 401: error_message_http = "  Error: Clave API de VirusTotal inválida o no autorizada.\n"
-                elif e_http.response.status_code == 429: error_message_http = "  Error: Límite de tasa de API de VirusTotal alcanzado.\n"
-                elif e_http.response.status_code == 404: error_message_http = f"  Error: Recurso '{resource}' no encontrado en VirusTotal.\n"
-                else: error_message_http = f"  Error HTTP al contactar VirusTotal: {e_http.response.status_code} {e_http.response.reason}.\n"
-                print(error_message_http.strip())
-                f_vt_report.write(error_message_http + "\n") # Use the file handle opened with 'with'
-                console_summary_message += error_message_http 
-            except requests.exceptions.RequestException as e_req: # General network errors
-                message = f"  Error de red al contactar VirusTotal: {type(e_req).__name__}.\n"
-                print(message.strip())
-                f_vt_report.write(message + "\n") # Use the file handle
-                console_summary_message += message 
-            except json.JSONDecodeError as e_json:
-                message = f"  Error al decodificar JSON de VirusTotal: {e_json}.\n"
-                print(message.strip())
-                f_vt_report.write(message + "\n") # Use the file handle
-                console_summary_message += message 
-            finally: # This finally is for the inner try-except block for API calls
-                # Ensure the "End of Results" is written before the 'with' statement closes the file
-                # if the file was successfully opened.
-                # If 'f_vt_report' is not defined (e.g. outer IOError), this won't be reached.
-                if 'f_vt_report' in locals() and not f_vt_report.closed:
-                    f_vt_report.write("--- Fin de Resultados de VirusTotal ---\n\n")
-                print("--- Fin de Resultados de VirusTotal ---")
-    
-    except IOError as e_io_file: # Error opening the output_file_path
+    except IOError as e_io_file: 
         io_error_msg = f"Error de E/S al abrir el archivo de reporte '{output_file_path}': {e_io_file}\n"
         print(io_error_msg.strip())
-        # Add to console summary that file couldn't be written
         console_summary_message += io_error_msg
-    except Exception as e_gen_outer: # Catch any other unexpected errors in the outer scope
-        gen_outer_error_msg = f"  Error inesperado general en get_virustotal_report: {type(e_gen_outer).__name__} - {e_gen_outer}.\n"
-        print(gen_outer_error_msg.strip())
-        console_summary_message += gen_outer_error_msg
-        # Try to write to file if it was opened, otherwise this will also fail if IOError was the cause
+        web_scraping_summary_message = "  Web scraping: No intentado debido a error de E/S del archivo de reporte.\n"
+        console_summary_message += web_scraping_summary_message
+        return console_summary_message.strip() 
+
+    # --- Web Scraping Section (Appends to the same file) ---
+    scraped_data_written_to_file = False
+    try:
+        with open(output_file_path, 'a', encoding='utf-8') as f_vt_report_scrape: 
+            f_vt_report_scrape.write("--- Web Scraped Relations Data (from GUI) ---\n")
+            print(f"Intentando web scraping de {gui_link_relations}...")
+            
+            headers_scrape = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            scrape_response = requests.get(gui_link_relations, headers=headers_scrape, timeout=30)
+            scrape_response.raise_for_status()
+            
+            soup = BeautifulSoup(scrape_response.content, 'lxml')
+            
+            passive_dns_section_title = "Passive DNS Replication"
+            section_header_tag = soup.find(lambda tag: tag.name and passive_dns_section_title in tag.get_text(strip=True))
+
+            if section_header_tag:
+                f_vt_report_scrape.write(f"\n{passive_dns_section_title} (Scraped from GUI):\n")
+                
+                container = section_header_tag.find_parent('vt-ui-expandable-tree-node')
+                if not container: 
+                    parent_of_header = section_header_tag.find_parent()
+                    if parent_of_header:
+                        container = parent_of_header.find_next_sibling('div')
+                    if not container and parent_of_header and parent_of_header.parent:
+                         parent_of_header_parent = parent_of_header.parent
+                         container = parent_of_header_parent.find_next_sibling('div')
+
+                if container:
+                    rows = container.select('div[role="row"], vt-ui-row-details') 
+                    if not rows: 
+                        rows = container.find_all('div', class_=re.compile(r'(^|\s)(row|item|entry)($|\s)'), recursive=True)
+
+                    if rows:
+                        f_vt_report_scrape.write(f"{'Date resolved':<15} {'Detections':<12} {'Resolver':<32} {'Domain/IP'}\n")
+                        f_vt_report_scrape.write("-" * 80 + "\n")
+                        
+                        parsed_rows_count = 0
+                        for row_el in rows[:30]: 
+                            cells = row_el.find_all('div', {'role': 'gridcell'}, recursive=False)
+                            if not cells: 
+                                cells = row_el.find_all('div', recursive=False) 
+                            
+                            cell_texts = [cell.get_text(strip=True) for cell in cells if cell.get_text(strip=True)]
+
+                            if len(cell_texts) >= 2: 
+                                date_str, detections_str, resolver_str, domain_str = "N/A", "N/A", "N/A", "N/A"
+                                
+                                for i, text in enumerate(cell_texts):
+                                    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', text) or (text.isdigit() and len(text) > 8):
+                                        date_str = text
+                                        if date_str.isdigit():
+                                            try: date_str = datetime.fromtimestamp(int(date_str)).strftime('%Y-%m-%d')
+                                            except (ValueError, OSError): pass
+                                        break
+                                
+                                for i, text in enumerate(cell_texts):
+                                    if re.fullmatch(r'\d+\s*/\s*\d+', text):
+                                        detections_str = text
+                                        break
+                                
+                                remaining_texts = [t for t in cell_texts if t not in [date_str, detections_str] and t != "N/A" and t]
+                                
+                                if remaining_texts:
+                                    found_domain = False
+                                    for idx, text_item in enumerate(remaining_texts):
+                                        if '.' in text_item or re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', text_item):
+                                            domain_str = text_item
+                                            remaining_texts.pop(idx)
+                                            found_domain = True
+                                            break
+                                    if not found_domain and remaining_texts: 
+                                        domain_str = remaining_texts.pop(-1) if remaining_texts else "N/A"
+                                    
+                                    if remaining_texts: resolver_str = remaining_texts[0]
+
+                                if domain_str != "N/A" and len(domain_str) > 2: 
+                                    f_vt_report_scrape.write(f"{date_str:<15} {detections_str:<12} {resolver_str:<32} {domain_str}\n")
+                                    scraped_data_written_to_file = True
+                                    parsed_rows_count += 1
+                                    if parsed_rows_count >= 25: break 
+                        
+                        if not scraped_data_written_to_file:
+                             f_vt_report_scrape.write("  No specific data rows parsed with current heuristics under Passive DNS section.\n")
+                    else:
+                        f_vt_report_scrape.write("  Could not find any row-like elements in the identified Passive DNS container.\n")
+                else:
+                    f_vt_report_scrape.write("  Could not identify a container for Passive DNS data rows near the header.\n")
+            else:
+                f_vt_report_scrape.write("  'Passive DNS Replication' section header not found on the GUI page.\n")
+
+            if scraped_data_written_to_file:
+                web_scraping_summary_message = "  Web scraping for GUI relations: Some data found and appended to report.\n"
+            else:
+                web_scraping_summary_message = "  Web scraping for GUI relations: Attempted, but no specific Passive DNS data parsed/found with current heuristics.\n"
+            f_vt_report_scrape.write("--- Fin de Web Scraped Relations Data ---\n\n")
+
+    except requests.exceptions.RequestException as e_scrape_req:
+        err_msg_scrape = f"  Error during web scraping request for '{gui_link_relations}': {type(e_scrape_req).__name__}.\n"
+        print(err_msg_scrape.strip())
+        web_scraping_summary_message = f"  Web scraping for GUI relations: Request failed ({type(e_scrape_req).__name__}).\n"
         try:
-            with open(output_file_path, 'a', encoding='utf-8') as f_vt_report_err: # Append if already exists
-                 f_vt_report_err.write(gen_outer_error_msg + "\n--- Fin de Resultados de VirusTotal (con error) ---\n\n")
-        except Exception: # nosemgrep: generic-exception-handled
-            pass # If file cannot be written to, we already noted it or will note via console_summary_message
+            with open(output_file_path, 'a', encoding='utf-8') as f_err: f_err.write(err_msg_scrape)
+        except IOError: pass 
+    except Exception as e_scrape_parse:
+        err_msg_scrape_parse = f"  Error parsing HTML or extracting data from '{gui_link_relations}': {type(e_scrape_parse).__name__} - {e_scrape_parse}.\n"
+        print(err_msg_scrape_parse.strip())
+        web_scraping_summary_message = f"  Web scraping for GUI relations: Parsing/extraction failed ({type(e_scrape_parse).__name__}).\n"
+        try:
+            with open(output_file_path, 'a', encoding='utf-8') as f_err: f_err.write(err_msg_scrape_parse)
+        except IOError: pass
+        
+    console_summary_message += web_scraping_summary_message
+    if not console_summary_message.strip().endswith(web_scraping_summary_message.strip()) and \
+       console_summary_message == f"  Resumen de VirusTotal para '{resource}':\n": 
+         console_summary_message = f"  Resumen de VirusTotal para '{resource}': No se pudo generar el resumen API detallado. " + web_scraping_summary_message
     
-    # This return is part of the outer try-except related to file opening.
-    # It will be reached if the file was opened, or if an API error occurred after opening.
-    if console_summary_message == f"  Resumen de VirusTotal para '{resource}':\n": 
-        console_summary_message += "  No se pudo generar el resumen detallado debido a un error o falta de datos.\n"
     return console_summary_message.strip()
 
 
