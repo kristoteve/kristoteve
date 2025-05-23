@@ -607,13 +607,56 @@ def get_virustotal_report(resource, api_key, report_file_handle):
         report_file_handle.write(basic_summary_part + "\n") # Write to report file
         console_summary_message += basic_summary_part # Add to the message to be returned
 
-        # --- Fetch and display Passive DNS Replication (only for domains) ---
-        # This data will be added to both the console summary and the report file.
-        passive_dns_summary_part_for_console = "" # Specifically for console_summary_message
-        if not is_ip: # Passive DNS is typically more relevant for domains
+        # --- Conditional fetching for IP Resolutions or Domain Passive DNS/Siblings ---
+        if is_ip:
+            # --- Fetch and display Resolutions for IP addresses ---
+            ip_resolutions_summary_part_for_console = ""
+            resolutions_url = f"{base_url}ip_addresses/{resource}/resolutions"
+            resolutions_report_part_for_file = f"--- Passive DNS Replication (Resolutions) for IP '{resource}' ---\n"
+            current_resolutions_console_summary = "  Passive DNS Replication (Resolutions):\n"
+            try:
+                resolutions_response = requests.get(resolutions_url, headers=headers, timeout=20)
+                resolutions_response.raise_for_status()
+                resolutions_data = resolutions_response.json().get('data', [])
+
+                if resolutions_data:
+                    resolutions_report_part_for_file += "  Hostnames que resolvieron a esta IP:\n"
+                    found_resolutions = []
+                    for resolution_entry in resolutions_data:
+                        attrs = resolution_entry.get('attributes', {})
+                        host_name = attrs.get('host_name', 'N/A')
+                        date_timestamp = attrs.get('date') # Unix timestamp
+                        # Convert timestamp to human-readable date if needed, for now just include
+                        entry_text = f"    - {host_name} (Última resolución registrada: {date_timestamp})\n"
+                        if host_name != 'N/A':
+                            resolutions_report_part_for_file += entry_text
+                            found_resolutions.append(entry_text) # Store full text for console
+                    if found_resolutions:
+                        for res_text_cs in found_resolutions:
+                            current_resolutions_console_summary += res_text_cs # Use pre-formatted text
+                    else:
+                        no_data_msg = "  No se encontraron nombres de host válidos en los datos de resoluciones.\n"
+                        resolutions_report_part_for_file += no_data_msg
+                        current_resolutions_console_summary += no_data_msg
+                else:
+                    no_data_msg = f"  No se encontraron datos de resoluciones (Passive DNS) para la IP '{resource}'.\n"
+                    resolutions_report_part_for_file += no_data_msg
+                    current_resolutions_console_summary += no_data_msg
+            except requests.exceptions.RequestException as e_res:
+                err_msg_res = f"  Error al obtener resoluciones para la IP '{resource}': {type(e_res).__name__}.\n"
+                resolutions_report_part_for_file += err_msg_res
+                current_resolutions_console_summary += err_msg_res
+                print(err_msg_res.strip())
+            finally:
+                report_file_handle.write(resolutions_report_part_for_file + "\n")
+                ip_resolutions_summary_part_for_console = current_resolutions_console_summary
+                console_summary_message += ip_resolutions_summary_part_for_console
+        else: # It's a domain, fetch Passive DNS and Siblings
+            # --- Fetch and display Passive DNS Replication (only for domains) ---
+            passive_dns_summary_part_for_console = "" 
             passive_dns_url = f"{base_url}domains/{resource}/passive_dns"
-            passive_dns_report_part_for_file = "--- Passive DNS Replication ---\n" # For file report
-            current_passive_dns_console_summary = "  Passive DNS Replication:\n" # Temp var for this section's console output
+            passive_dns_report_part_for_file = "--- Passive DNS Replication ---\n" 
+            current_passive_dns_console_summary = "  Passive DNS Replication:\n" 
             try:
                 passive_dns_response = requests.get(passive_dns_url, headers=headers, timeout=20)
                 passive_dns_response.raise_for_status()
@@ -646,16 +689,14 @@ def get_virustotal_report(resource, api_key, report_file_handle):
                 print(err_msg_pdns.strip())
             finally:
                 report_file_handle.write(passive_dns_report_part_for_file + "\n")
-                passive_dns_summary_part_for_console = current_passive_dns_console_summary # Assign to be added to main console summary
+                passive_dns_summary_part_for_console = current_passive_dns_console_summary 
                 console_summary_message += passive_dns_summary_part_for_console
 
-        # --- Fetch and display Siblings (Subdomains - only for domains) ---
-        # This data will be added to both the console summary and the report file.
-        siblings_summary_part_for_console = "" # Specifically for console_summary_message
-        if not is_ip: # Subdomains are relevant for domains
-            siblings_url = f"{base_url}domains/{resource}/subdomains" # Correct endpoint for subdomains
-            siblings_report_part_for_file = "--- Subdominios (Siblings) ---\n" # For file report
-            current_siblings_console_summary = "  Subdominios (Siblings):\n" # Temp var for this section's console output
+            # --- Fetch and display Siblings (Subdomains - only for domains) ---
+            siblings_summary_part_for_console = "" 
+            siblings_url = f"{base_url}domains/{resource}/subdomains" 
+            siblings_report_part_for_file = "--- Subdominios (Siblings) ---\n" 
+            current_siblings_console_summary = "  Subdominios (Siblings):\n" 
             try:
                 siblings_response = requests.get(siblings_url, headers=headers, timeout=20)
                 siblings_response.raise_for_status()
@@ -687,7 +728,7 @@ def get_virustotal_report(resource, api_key, report_file_handle):
                 print(err_msg_sibl.strip())
             finally:
                 report_file_handle.write(siblings_report_part_for_file + "\n")
-                siblings_summary_part_for_console = current_siblings_console_summary # Assign to be added to main console summary
+                siblings_summary_part_for_console = current_siblings_console_summary 
                 console_summary_message += siblings_summary_part_for_console
 
     except requests.exceptions.HTTPError as e:
