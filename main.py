@@ -22,6 +22,32 @@ import json
 import dns.resolver # Added for this function
 import requests
 
+# --- Sanitization Function ---
+def sanitize_filename(name: str) -> str:
+    """
+    Sanitizes a string to be safe for use as a filename or directory name.
+    - Replaces dots (.) with underscores (_).
+    - Replaces common problematic characters with underscores (_).
+    - If the name becomes empty after sanitization, returns 'default_target'.
+    """
+    if not name: # Handle None or empty string input
+        return "default_target"
+
+    # Replace dots first
+    name = name.replace('.', '_')
+
+    # Replace other problematic characters
+    # Problematic characters: / \ : * ? " < > |
+    # Also, stripping leading/trailing whitespace and replacing internal whitespace sequences with a single underscore
+    name = re.sub(r'[\\/:*?"<>|]', '_', name)
+    name = re.sub(r'\s+', '_', name.strip()) # Consolidate whitespace and strip ends
+
+    # If the name is empty after sanitization (e.g., input was only problematic chars)
+    if not name:
+        return "default_target"
+    
+    return name
+
 # --- Cloudflare IP Range Handling Notes ---
 # Cloudflare publishes its IP ranges:
 # IPv4: https://www.cloudflare.com/ips-v4
@@ -52,10 +78,14 @@ SERVICE_PREFIXES = [ # As per task description
 ]
 
 # --- Definition of perform_full_scan function ---
-def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_key, vd_api_key):
+def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_key, vd_api_key, base_directory):
     current_run_results = {}
-    dominio_for_report = target_input.strip()
+    dominio_for_report = target_input.strip() # Original, unsanitized for display/API use
     current_run_results['original_target'] = dominio_for_report
+    
+    # Sanitize for file names within this scan context
+    sanitized_dominio_for_filenames = sanitize_filename(dominio_for_report)
+
 
     # Write initial header to the provided file handle
     main_report_file_handle.write(f"\n\n--- Resultados del Escaneo Detallado para '{dominio_for_report}' ---\n")
@@ -183,8 +213,14 @@ def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_
     current_run_results['consolidated_potential_origin_ips'] = sorted(list(consolidated_potential_origin_ips_set_local))
 
     # VirusTotal and ViewDNS reports
-    current_run_results['virustotal_summary'] = get_virustotal_report(dominio_for_report, vt_api_key, main_report_file_handle)
-    current_run_results['viewdns_summary'] = get_viewdns_info(dominio_for_report, vd_api_key, main_report_file_handle)
+    # Use sanitized name for filenames
+    vt_report_filename = os.path.join(base_directory, f"virustotal_report_{sanitized_dominio_for_filenames}.txt")
+    current_run_results['virustotal_summary'] = get_virustotal_report(dominio_for_report, vt_api_key, vt_report_filename) # Pass original for API
+    main_report_file_handle.write(f"Reporte de VirusTotal para '{dominio_for_report}' generado en: {vt_report_filename}\n")
+
+    vd_report_filename = os.path.join(base_directory, f"viewdns_report_{sanitized_dominio_for_filenames}.txt")
+    current_run_results['viewdns_summary'] = get_viewdns_info(dominio_for_report, vd_api_key, vd_report_filename) # Pass original for API
+    main_report_file_handle.write(f"Reporte de ViewDNS para '{dominio_for_report}' generado en: {vd_report_filename}\n")
 
     # Ping Check
     check_reachability_with_ping(target_ip_for_scan_local, main_report_file_handle)
@@ -202,7 +238,7 @@ def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_
         for port_num in open_ports_list_local:
             if port_num == 80 or port_num == 443 or port_num >= 8000:
                 for path_segment in paths_to_check:
-                    fetch_http_content(target_ip_for_scan_local, port_num, path_segment, main_report_file_handle)
+                    fetch_http_content(target_ip_for_scan_local, port_num, path_segment, main_report_file_handle, base_directory)
     else:
         main_report_file_handle.write(f"No se encontraron puertos abiertos o hubo un error durante el escaneo en {target_ip_for_scan_local}.\n")
     main_report_file_handle.write("--- Fin de Resultados del Escaneo de Puertos ---\n\n")
@@ -543,345 +579,378 @@ def check_related_services_dns(target_domain, subdomains_found=None):
 
     return list(potential_origins)
 
-def get_virustotal_report(resource, api_key, report_file_handle):
+# MODIFIED SIGNATURE: Takes output_file_path instead of report_file_handle
+def get_virustotal_report(resource, api_key, output_file_path):
     print(f"\n--- Obteniendo reporte de VirusTotal para '{resource}' ---")
-    report_file_handle.write(f"--- Resultados de VirusTotal para '{resource}' ---\n")
-
-    if not api_key:
-        message = "  API key de VirusTotal no proporcionada. Omitiendo esta comprobación.\n"
-        print(message.strip())
-        report_file_handle.write(message + "\n")
-        return message # Return the message to be stored in current_run_results['virustotal_summary']
-
-    base_url = "https://www.virustotal.com/api/v3/"
-    headers = {"x-apikey": api_key, "User-Agent": "Python Security Scanner Script/1.0"}
-    # This summary will be returned by the function and printed by display_scan_findings
-    # It will also be used if an early error occurs.
+    # console_summary_message will be returned for display in the main console
     console_summary_message = f"  Resumen de VirusTotal para '{resource}':\n"
 
-
-    is_ip = False
     try:
-        ipaddress.ip_address(resource)
-        is_ip = True
-    except ValueError:
-        pass
+        with open(output_file_path, 'w', encoding='utf-8') as f_vt_report:
+            f_vt_report.write(f"--- Resultados de VirusTotal para '{resource}' ---\n")
 
-    # Determine the correct main VirusTotal API endpoint and GUI link based on resource type
-    if is_ip:
-        url = f"{base_url}ip_addresses/{resource}"
-        gui_link = f"https://www.virustotal.com/gui/ip-address/{resource}/relations"
-    else: # Domain
-        url = f"{base_url}domains/{resource}"
-        gui_link = f"https://www.virustotal.com/gui/domain/{resource}/relations" # MODIFIED as per requirement
-
-    try:
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status() # Check for HTTP errors
-
-        data = response.json().get('data', {})
-        attributes = data.get('attributes', {})
-
-        if not attributes:
-            message = f"  No se encontraron atributos en la respuesta de VirusTotal para '{resource}'.\n"
-            print(message.strip())
-            report_file_handle.write(message + "\n")
-            console_summary_message += message # Append to console summary
-            return console_summary_message # Return the summary message
-
-        stats = attributes.get('last_analysis_stats', {})
-        malicious = stats.get('malicious', 0)
-        suspicious = stats.get('suspicious', 0)
-        harmless = stats.get('harmless', 0)
-        undetected = stats.get('undetected', 0)
-
-        # Basic summary for console and file
-        basic_summary_part = (
-            f"  Maliciosos: {malicious}\n"
-            f"  Sospechosos: {suspicious}\n"
-            f"  Inofensivos: {harmless}\n"
-            f"  No detectados: {undetected}\n"
-            f"  Enlace al reporte completo (GUI): {gui_link}\n"
-        )
-        print(basic_summary_part.strip()) # Print basic summary to console
-        report_file_handle.write(basic_summary_part + "\n") # Write to report file
-        console_summary_message += basic_summary_part # Add to the message to be returned
-
-        # --- Conditional fetching for IP Resolutions or Domain Passive DNS/Siblings ---
-        if is_ip:
-            # --- Fetch and display Resolutions for IP addresses ---
-            ip_resolutions_summary_part_for_console = ""
-            resolutions_url = f"{base_url}ip_addresses/{resource}/resolutions"
-            resolutions_report_part_for_file = f"--- Passive DNS Replication (Resolutions) for IP '{resource}' ---\n"
-            current_resolutions_console_summary = "  Passive DNS Replication (Resolutions):\n"
-            try:
-                resolutions_response = requests.get(resolutions_url, headers=headers, timeout=20)
-                resolutions_response.raise_for_status()
-                resolutions_data = resolutions_response.json().get('data', [])
-
-                if resolutions_data:
-                    resolutions_report_part_for_file += "  Hostnames que resolvieron a esta IP:\n"
-                    found_resolutions = []
-                    for resolution_entry in resolutions_data:
-                        attrs = resolution_entry.get('attributes', {})
-                        host_name = attrs.get('host_name', 'N/A')
-                        date_timestamp = attrs.get('date') # Unix timestamp
-                        # Convert timestamp to human-readable date if needed, for now just include
-                        entry_text = f"    - {host_name} (Última resolución registrada: {date_timestamp})\n"
-                        if host_name != 'N/A':
-                            resolutions_report_part_for_file += entry_text
-                            found_resolutions.append(entry_text) # Store full text for console
-                    if found_resolutions:
-                        for res_text_cs in found_resolutions:
-                            current_resolutions_console_summary += res_text_cs # Use pre-formatted text
-                    else:
-                        no_data_msg = "  No se encontraron nombres de host válidos en los datos de resoluciones.\n"
-                        resolutions_report_part_for_file += no_data_msg
-                        current_resolutions_console_summary += no_data_msg
-                else:
-                    no_data_msg = f"  No se encontraron datos de resoluciones (Passive DNS) para la IP '{resource}'.\n"
-                    resolutions_report_part_for_file += no_data_msg
-                    current_resolutions_console_summary += no_data_msg
-            except requests.exceptions.RequestException as e_res:
-                err_msg_res = f"  Error al obtener resoluciones para la IP '{resource}': {type(e_res).__name__}.\n"
-                resolutions_report_part_for_file += err_msg_res
-                current_resolutions_console_summary += err_msg_res
-                print(err_msg_res.strip())
-            finally:
-                report_file_handle.write(resolutions_report_part_for_file + "\n")
-                ip_resolutions_summary_part_for_console = current_resolutions_console_summary
-                console_summary_message += ip_resolutions_summary_part_for_console
-        else: # It's a domain, fetch Passive DNS and Siblings
-            # --- Fetch and display Passive DNS Replication (only for domains) ---
-            passive_dns_summary_part_for_console = "" 
-            passive_dns_url = f"{base_url}domains/{resource}/passive_dns"
-            passive_dns_report_part_for_file = "--- Passive DNS Replication ---\n" 
-            current_passive_dns_console_summary = "  Passive DNS Replication:\n" 
-            try:
-                passive_dns_response = requests.get(passive_dns_url, headers=headers, timeout=20)
-                passive_dns_response.raise_for_status()
-                passive_dns_data = passive_dns_response.json().get('data', [])
-
-                if passive_dns_data:
-                    passive_dns_report_part_for_file += "  IPs Históricas (Passive DNS):\n"
-                    found_pdns_ips = []
-                    for dns_entry in passive_dns_data:
-                        ip_addr = dns_entry.get('attributes', {}).get('ip_address', 'N/A')
-                        if ip_addr != 'N/A':
-                             passive_dns_report_part_for_file += f"    - {ip_addr}\n"
-                             found_pdns_ips.append(ip_addr)
-                    if found_pdns_ips:
-                        for ip_addr_cs in found_pdns_ips:
-                            current_passive_dns_console_summary += f"    - {ip_addr_cs}\n"
-                    else:
-                        no_data_msg = "  No se encontraron IPs válidas en los datos de Passive DNS.\n"
-                        passive_dns_report_part_for_file += no_data_msg
-                        current_passive_dns_console_summary += no_data_msg
-                else:
-                    no_data_msg = "  No se encontraron datos de Passive DNS.\n"
-                    passive_dns_report_part_for_file += no_data_msg
-                    current_passive_dns_console_summary += no_data_msg
-
-            except requests.exceptions.RequestException as e_pdns:
-                err_msg_pdns = f"  Error al obtener Passive DNS para '{resource}': {type(e_pdns).__name__}.\n"
-                passive_dns_report_part_for_file += err_msg_pdns
-                current_passive_dns_console_summary += err_msg_pdns
-                print(err_msg_pdns.strip())
-            finally:
-                report_file_handle.write(passive_dns_report_part_for_file + "\n")
-                passive_dns_summary_part_for_console = current_passive_dns_console_summary 
-                console_summary_message += passive_dns_summary_part_for_console
-
-            # --- Fetch and display Siblings (Subdomains - only for domains) ---
-            siblings_summary_part_for_console = "" 
-            siblings_url = f"{base_url}domains/{resource}/subdomains" 
-            siblings_report_part_for_file = "--- Subdominios (Siblings) ---\n" 
-            current_siblings_console_summary = "  Subdominios (Siblings):\n" 
-            try:
-                siblings_response = requests.get(siblings_url, headers=headers, timeout=20)
-                siblings_response.raise_for_status()
-                siblings_data = siblings_response.json().get('data', [])
-
-                if siblings_data:
-                    siblings_report_part_for_file += "  Subdominios Encontrados:\n"
-                    found_subdomains = []
-                    for sibling_entry in siblings_data:
-                        subdomain_id = sibling_entry.get('id', 'N/A')
-                        if subdomain_id != 'N/A':
-                            siblings_report_part_for_file += f"    - {subdomain_id}\n"
-                            found_subdomains.append(subdomain_id)
-                    if found_subdomains:
-                        for sub_id_cs in found_subdomains:
-                            current_siblings_console_summary += f"    - {sub_id_cs}\n"
-                    else:
-                        no_data_msg = "  No se encontraron IDs de subdominios válidos.\n"
-                        siblings_report_part_for_file += no_data_msg
-                        current_siblings_console_summary += no_data_msg
-                else:
-                    no_data_msg = "  No se encontraron subdominios.\n"
-                    siblings_report_part_for_file += no_data_msg
-                    current_siblings_console_summary += no_data_msg
-            except requests.exceptions.RequestException as e_sibl:
-                err_msg_sibl = f"  Error al obtener subdominios para '{resource}': {type(e_sibl).__name__}.\n"
-                siblings_report_part_for_file += err_msg_sibl
-                current_siblings_console_summary += err_msg_sibl
-                print(err_msg_sibl.strip())
-            finally:
-                report_file_handle.write(siblings_report_part_for_file + "\n")
-                siblings_summary_part_for_console = current_siblings_console_summary 
-                console_summary_message += siblings_summary_part_for_console
-
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 401:
-            message = "  Error: Clave API de VirusTotal inválida o no autorizada.\n"
-        elif e.response.status_code == 429:
-            message = "  Error: Límite de tasa de API de VirusTotal alcanzado.\n"
-        elif e.response.status_code == 404:
-            message = f"  Error: Recurso '{resource}' no encontrado en VirusTotal.\n"
-        else:
-            message = f"  Error HTTP al contactar VirusTotal: {e.response.status_code} {e.response.reason}.\n"
-        print(message.strip())
-        report_file_handle.write(message + "\n")
-        console_summary_message += message # Append to console summary
-    except requests.exceptions.RequestException as e: # General network errors
-        message = f"  Error de red al contactar VirusTotal: {type(e).__name__}.\n"
-        print(message.strip())
-        report_file_handle.write(message + "\n")
-        console_summary_message += message # Append to console summary
-    except json.JSONDecodeError as e_json:
-        message = f"  Error al decodificar JSON de VirusTotal: {e_json}.\n"
-        print(message.strip())
-        report_file_handle.write(message + "\n")
-        console_summary_message += message # Append to console summary
-    except Exception as e: # Catch-all for other unexpected errors
-        message = f"  Error inesperado durante la consulta a VirusTotal: {type(e).__name__} - {e}.\n"
-        print(message.strip())
-        report_file_handle.write(message + "\n")
-        console_summary_message += message # Append to console summary
-    finally:
-        report_file_handle.write("--- Fin de Resultados de VirusTotal ---\n\n")
-        print("--- Fin de Resultados de VirusTotal ---")
-
-    # Ensure a default message if everything failed before console_summary_message was properly built
-    if console_summary_message == f"  Resumen de VirusTotal para '{resource}':\n": # only the initial part
-        console_summary_message += "  No se pudo generar el resumen detallado debido a un error.\n"
-
-    return console_summary_message.strip() # Return the full summary for display_scan_findings
-
-def get_viewdns_info(target, api_key, report_file_handle):
-    print(f"\n--- Obteniendo información de ViewDNS para '{target}' ---")
-    report_file_handle.write(f"--- Resultados de ViewDNS para '{target}' ---\n")
-    summary_parts = []
-
-    if not api_key:
-        message = "  API key de ViewDNS no proporcionada. Omitiendo esta comprobación.\n"
-        print(message.strip())
-        report_file_handle.write(message)
-        summary_parts.append(message)
-        report_file_handle.write("--- Fin de Resultados de ViewDNS ---\n\n")
-        return "\n\n".join(summary_parts)
-
-    base_url = "https://api.viewdns.info"
-    endpoints_to_query = []
-
-    # Endpoint 1: WHOIS (for both IP and domain)
-    endpoints_to_query.append({
-        "name": "WHOIS",
-        "url": f"{base_url}/whois/?domain={target}&apikey={api_key}&output=json"
-    })
-
-    # Endpoint 2: Reverse IP
-    endpoints_to_query.append({
-        "name": "Reverse IP",
-        "url": f"{base_url}/reverseip/?host={target}&apikey={api_key}&output=json"
-    })
-
-    for endpoint_info in endpoints_to_query:
-        endpoint_name = endpoint_info["name"]
-        url = endpoint_info["url"]
-
-        current_summary = f"--- Resultados de {endpoint_name} (ViewDNS) para '{target}' ---\n"
-        report_file_handle.write(current_summary)
-        print(f"  Consultando {endpoint_name} de ViewDNS para '{target}'...")
-
-        try:
-            response = requests.get(url, timeout=20)
-            response.raise_for_status()
-            data = response.json()
-
-            if 'response' in data and isinstance(data['response'], dict) and data['response'].get('error'):
-                error_msg_viewdns = data['response']['error']
-                message = f"  Error de API de ViewDNS ({endpoint_name}): {error_msg_viewdns}\n"
-                current_summary += message
+            if not api_key:
+                message = "  API key de VirusTotal no proporcionada. Omitiendo esta comprobación.\n"
                 print(message.strip())
-            else:
-                if endpoint_name == "WHOIS":
-                    whois_data = data.get('response', {}).get('whois', {})
-                    if whois_data:
-                        parsed_records = whois_data.get('parsed')
-                        if parsed_records and isinstance(parsed_records, list) and any(rec.get('value') for rec in parsed_records):
-                            current_summary += "  Datos WHOIS (Analizados):\n"
-                            for record in parsed_records:
-                                if record.get('name') and record.get('value'):
-                                    current_summary += f"    {record['name']}: {record['value']}\n"
-                        elif whois_data.get('raw'):
-                            current_summary += "  Datos WHOIS (Crudos):\n"
-                            current_summary += whois_data['raw'] + "\n"
+                f_vt_report.write(message + "\n")
+                # Still add to console summary that it was skipped
+                console_summary_message += message.strip() + " (Reporte detallado en archivo indica lo mismo).\n"
+                return console_summary_message 
+
+            base_url = "https://www.virustotal.com/api/v3/"
+            headers = {"x-apikey": api_key, "User-Agent": "Python Security Scanner Script/1.0"}
+            
+            is_ip = False
+            try:
+                ipaddress.ip_address(resource)
+                is_ip = True
+            except ValueError:
+                pass
+
+            if is_ip:
+                url = f"{base_url}ip_addresses/{resource}"
+                gui_link = f"https://www.virustotal.com/gui/ip-address/{resource}/relations"
+            else: # Domain
+                url = f"{base_url}domains/{resource}"
+                gui_link = f"https://www.virustotal.com/gui/domain/{resource}/relations"
+
+            try:
+                response_main = requests.get(url, headers=headers, timeout=20)
+                response_main.raise_for_status()
+                data = response_main.json().get('data', {})
+                attributes = data.get('attributes', {})
+
+                if not attributes:
+                    message = f"  No se encontraron atributos en la respuesta de VirusTotal para '{resource}'.\n"
+                    print(message.strip())
+                    f_vt_report.write(message + "\n")
+                    console_summary_message += message
+                    # Early return of summary if no attributes found
+                    f_vt_report.write("--- Fin de Resultados de VirusTotal ---\n\n")
+                    return console_summary_message
+
+                stats = attributes.get('last_analysis_stats', {})
+                malicious = stats.get('malicious', 0)
+                suspicious = stats.get('suspicious', 0)
+                harmless = stats.get('harmless', 0)
+                undetected = stats.get('undetected', 0)
+
+                basic_summary_part = (
+                    f"  Maliciosos: {malicious}\n"
+                    f"  Sospechosos: {suspicious}\n"
+                    f"  Inofensivos: {harmless}\n"
+                    f"  No detectados: {undetected}\n"
+                    f"  Enlace al reporte completo (GUI): {gui_link}\n"
+                )
+                print(basic_summary_part.strip())
+                f_vt_report.write(basic_summary_part + "\n")
+                console_summary_message += basic_summary_part
+
+                if is_ip:
+                    ip_resolutions_summary_part_for_console = ""
+                    resolutions_url = f"{base_url}ip_addresses/{resource}/resolutions"
+                    resolutions_report_part_for_file = f"--- Passive DNS Replication (Resolutions) for IP '{resource}' ---\n"
+                    current_resolutions_console_summary = "  Passive DNS Replication (Resolutions):\n"
+                    try:
+                        resolutions_response = requests.get(resolutions_url, headers=headers, timeout=20)
+                        resolutions_response.raise_for_status()
+                        resolutions_data = resolutions_response.json().get('data', [])
+                        if resolutions_data:
+                            resolutions_report_part_for_file += "  Hostnames que resolvieron a esta IP:\n"
+                            found_resolutions = []
+                            for entry in resolutions_data:
+                                attrs_res = entry.get('attributes', {})
+                                host = attrs_res.get('host_name', 'N/A')
+                                date_ts = attrs_res.get('date')
+                                entry_txt = f"    - {host} (Última resolución registrada: {date_ts})\n"
+                                if host != 'N/A':
+                                    resolutions_report_part_for_file += entry_txt
+                                    found_resolutions.append(entry_txt)
+                            if found_resolutions:
+                                for res_txt_cs in found_resolutions: current_resolutions_console_summary += res_txt_cs
+                            else:
+                                no_data_msg_res = "  No se encontraron nombres de host válidos en los datos de resoluciones.\n"
+                                resolutions_report_part_for_file += no_data_msg_res
+                                current_resolutions_console_summary += no_data_msg_res
                         else:
-                            current_summary += "  No se encontraron datos WHOIS o estaban en un formato inesperado.\n"
-                        print(f"    Datos de WHOIS para '{target}' obtenidos.")
+                            no_data_msg_res = f"  No se encontraron datos de resoluciones (Passive DNS) para la IP '{resource}'.\n"
+                            resolutions_report_part_for_file += no_data_msg_res
+                            current_resolutions_console_summary += no_data_msg_res
+                    except requests.exceptions.RequestException as e_res_ip:
+                        err_msg_res_ip = f"  Error al obtener resoluciones para la IP '{resource}': {type(e_res_ip).__name__}.\n"
+                        resolutions_report_part_for_file += err_msg_res_ip
+                        current_resolutions_console_summary += err_msg_res_ip
+                        print(err_msg_res_ip.strip())
+                    finally:
+                        f_vt_report.write(resolutions_report_part_for_file + "\n")
+                        ip_resolutions_summary_part_for_console = current_resolutions_console_summary
+                        console_summary_message += ip_resolutions_summary_part_for_console
+                else: # It's a domain
+                    passive_dns_summary_part_for_console = ""
+                    passive_dns_url = f"{base_url}domains/{resource}/passive_dns"
+                    passive_dns_report_part_for_file = "--- Passive DNS Replication ---\n"
+                    current_passive_dns_console_summary = "  Passive DNS Replication:\n"
+                    try:
+                        passive_dns_resp = requests.get(passive_dns_url, headers=headers, timeout=20)
+                        passive_dns_resp.raise_for_status()
+                        passive_dns_data_list = passive_dns_resp.json().get('data', [])
+                        if passive_dns_data_list:
+                            passive_dns_report_part_for_file += "  IPs Históricas (Passive DNS):\n"
+                            found_pdns_ips_list = []
+                            for item in passive_dns_data_list:
+                                ip_val = item.get('attributes', {}).get('ip_address', 'N/A')
+                                if ip_val != 'N/A':
+                                    passive_dns_report_part_for_file += f"    - {ip_val}\n"
+                                    found_pdns_ips_list.append(ip_val)
+                            if found_pdns_ips_list:
+                                for ip_val_cs in found_pdns_ips_list: current_passive_dns_console_summary += f"    - {ip_val_cs}\n"
+                            else:
+                                no_data_msg_pdns = "  No se encontraron IPs válidas en los datos de Passive DNS.\n"
+                                passive_dns_report_part_for_file += no_data_msg_pdns
+                                current_passive_dns_console_summary += no_data_msg_pdns
+                        else:
+                            no_data_msg_pdns = "  No se encontraron datos de Passive DNS.\n"
+                            passive_dns_report_part_for_file += no_data_msg_pdns
+                            current_passive_dns_console_summary += no_data_msg_pdns
+                    except requests.exceptions.RequestException as e_pdns_dom:
+                        err_msg_pdns_dom = f"  Error al obtener Passive DNS para '{resource}': {type(e_pdns_dom).__name__}.\n"
+                        passive_dns_report_part_for_file += err_msg_pdns_dom
+                        current_passive_dns_console_summary += err_msg_pdns_dom
+                        print(err_msg_pdns_dom.strip())
+                    finally:
+                        f_vt_report.write(passive_dns_report_part_for_file + "\n")
+                        passive_dns_summary_part_for_console = current_passive_dns_console_summary
+                        console_summary_message += passive_dns_summary_part_for_console
+
+                    siblings_summary_part_for_console = ""
+                    siblings_url = f"{base_url}domains/{resource}/subdomains"
+                    siblings_report_part_for_file = "--- Subdominios (Siblings) ---\n"
+                    current_siblings_console_summary = "  Subdominios (Siblings):\n"
+                    try:
+                        siblings_resp = requests.get(siblings_url, headers=headers, timeout=20)
+                        siblings_resp.raise_for_status()
+                        siblings_data_list = siblings_resp.json().get('data', [])
+                        if siblings_data_list:
+                            siblings_report_part_for_file += "  Subdominios Encontrados:\n"
+                            found_subdomains_list = []
+                            for item_sibl in siblings_data_list:
+                                sub_id = item_sibl.get('id', 'N/A')
+                                if sub_id != 'N/A':
+                                    siblings_report_part_for_file += f"    - {sub_id}\n"
+                                    found_subdomains_list.append(sub_id)
+                            if found_subdomains_list:
+                                for sub_id_cs in found_subdomains_list: current_siblings_console_summary += f"    - {sub_id_cs}\n"
+                            else:
+                                no_data_msg_sibl = "  No se encontraron IDs de subdominios válidos.\n"
+                                siblings_report_part_for_file += no_data_msg_sibl
+                                current_siblings_console_summary += no_data_msg_sibl
+                        else:
+                            no_data_msg_sibl = "  No se encontraron subdominios.\n"
+                            siblings_report_part_for_file += no_data_msg_sibl
+                            current_siblings_console_summary += no_data_msg_sibl
+                    except requests.exceptions.RequestException as e_sibl_dom:
+                        err_msg_sibl_dom = f"  Error al obtener subdominios para '{resource}': {type(e_sibl_dom).__name__}.\n"
+                        siblings_report_part_for_file += err_msg_sibl_dom
+                        current_siblings_console_summary += err_msg_sibl_dom
+                        print(err_msg_sibl_dom.strip())
+                    finally:
+                        f_vt_report.write(siblings_report_part_for_file + "\n")
+                        siblings_summary_part_for_console = current_siblings_console_summary
+                        console_summary_message += siblings_summary_part_for_console
+            
+            except requests.exceptions.HTTPError as e_http:
+                error_message_http = ""
+                if e_http.response.status_code == 401: error_message_http = "  Error: Clave API de VirusTotal inválida o no autorizada.\n"
+                elif e_http.response.status_code == 429: error_message_http = "  Error: Límite de tasa de API de VirusTotal alcanzado.\n"
+                elif e_http.response.status_code == 404: error_message_http = f"  Error: Recurso '{resource}' no encontrado en VirusTotal.\n"
+                else: error_message_http = f"  Error HTTP al contactar VirusTotal: {e_http.response.status_code} {e_http.response.reason}.\n"
+                print(error_message_http.strip())
+                f_vt_report.write(error_message_http + "\n") # Use the file handle opened with 'with'
+                console_summary_message += error_message_http 
+            except requests.exceptions.RequestException as e_req: # General network errors
+                message = f"  Error de red al contactar VirusTotal: {type(e_req).__name__}.\n"
+                print(message.strip())
+                f_vt_report.write(message + "\n") # Use the file handle
+                console_summary_message += message 
+            except json.JSONDecodeError as e_json:
+                message = f"  Error al decodificar JSON de VirusTotal: {e_json}.\n"
+                print(message.strip())
+                f_vt_report.write(message + "\n") # Use the file handle
+                console_summary_message += message 
+            finally: # This finally is for the inner try-except block for API calls
+                # Ensure the "End of Results" is written before the 'with' statement closes the file
+                # if the file was successfully opened.
+                # If 'f_vt_report' is not defined (e.g. outer IOError), this won't be reached.
+                if 'f_vt_report' in locals() and not f_vt_report.closed:
+                    f_vt_report.write("--- Fin de Resultados de VirusTotal ---\n\n")
+                print("--- Fin de Resultados de VirusTotal ---")
+    
+    except IOError as e_io_file: # Error opening the output_file_path
+        io_error_msg = f"Error de E/S al abrir el archivo de reporte '{output_file_path}': {e_io_file}\n"
+        print(io_error_msg.strip())
+        # Add to console summary that file couldn't be written
+        console_summary_message += io_error_msg
+    except Exception as e_gen_outer: # Catch any other unexpected errors in the outer scope
+        gen_outer_error_msg = f"  Error inesperado general en get_virustotal_report: {type(e_gen_outer).__name__} - {e_gen_outer}.\n"
+        print(gen_outer_error_msg.strip())
+        console_summary_message += gen_outer_error_msg
+        # Try to write to file if it was opened, otherwise this will also fail if IOError was the cause
+        try:
+            with open(output_file_path, 'a', encoding='utf-8') as f_vt_report_err: # Append if already exists
+                 f_vt_report_err.write(gen_outer_error_msg + "\n--- Fin de Resultados de VirusTotal (con error) ---\n\n")
+        except Exception: # nosemgrep: generic-exception-handled
+            pass # If file cannot be written to, we already noted it or will note via console_summary_message
+    
+    # This return is part of the outer try-except related to file opening.
+    # It will be reached if the file was opened, or if an API error occurred after opening.
+    if console_summary_message == f"  Resumen de VirusTotal para '{resource}':\n": 
+        console_summary_message += "  No se pudo generar el resumen detallado debido a un error o falta de datos.\n"
+    return console_summary_message.strip()
+
+
+# MODIFIED SIGNATURE: Takes output_file_path instead of report_file_handle
+def get_viewdns_info(target, api_key, output_file_path):
+    print(f"\n--- Obteniendo información de ViewDNS para '{target}' ---")
+    # This summary will be returned for console display
+    console_summary_message = f"--- Resultados de ViewDNS para '{target}' ---\n"
+
+    try:
+        with open(output_file_path, 'w', encoding='utf-8') as f_vd_report:
+            f_vd_report.write(f"--- Resultados de ViewDNS para '{target}' ---\n")
+
+            if not api_key:
+                message = "  API key de ViewDNS no proporcionada. Omitiendo esta comprobación.\n"
+                print(message.strip())
+                f_vd_report.write(message + "\n")
+                console_summary_message += message.strip() + " (Reporte detallado en archivo indica lo mismo).\n"
+                f_vd_report.write("--- Fin de Resultados de ViewDNS ---\n\n")
+                return console_summary_message.strip()
+
+            base_url = "https://api.viewdns.info"
+            endpoints_to_query = []
+
+            endpoints_to_query.append({
+                "name": "WHOIS",
+                "url": f"{base_url}/whois/?domain={target}&apikey={api_key}&output=json"
+            })
+            endpoints_to_query.append({
+                "name": "Reverse IP",
+                "url": f"{base_url}/reverseip/?host={target}&apikey={api_key}&output=json"
+            })
+
+            for endpoint_info in endpoints_to_query:
+                endpoint_name = endpoint_info["name"]
+                url = endpoint_info["url"]
+                
+                endpoint_report_content = f"--- Resultados de {endpoint_name} (ViewDNS) para '{target}' ---\n"
+                print(f"  Consultando {endpoint_name} de ViewDNS para '{target}'...")
+
+                try:
+                    response = requests.get(url, timeout=20)
+                    response.raise_for_status()
+                    data = response.json()
+
+                    if 'response' in data and isinstance(data['response'], dict) and data['response'].get('error'):
+                        error_msg_api = data['response']['error']
+                        message_api = f"  Error de API de ViewDNS ({endpoint_name}): {error_msg_api}\n"
+                        endpoint_report_content += message_api
+                        console_summary_message += message_api # Add to main console summary
+                        print(message_api.strip())
                     else:
-                        current_summary += "  No se encontraron datos WHOIS en la respuesta.\n"
-                        print(f"    No se encontraron datos de WHOIS para '{target}'.")
+                        # ... (rest of the parsing logic for WHOIS and Reverse IP)
+                        # All "current_summary += ..." should become "endpoint_report_content += ..."
+                        # and also consider adding key findings to "console_summary_message"
+                        if endpoint_name == "WHOIS":
+                            whois_data = data.get('response', {}).get('whois', {})
+                            if whois_data:
+                                parsed_records = whois_data.get('parsed')
+                                if parsed_records and isinstance(parsed_records, list) and any(rec.get('value') for rec in parsed_records):
+                                    endpoint_report_content += "  Datos WHOIS (Analizados):\n"
+                                    console_summary_message += "  WHOIS (Analizados):\n"
+                                    for record in parsed_records:
+                                        if record.get('name') and record.get('value'):
+                                            line = f"    {record['name']}: {record['value']}\n"
+                                            endpoint_report_content += line
+                                            if record['name'].lower() in ['registrant organization', 'domain name', 'registrar']: # Key fields
+                                                console_summary_message += f"    {record['name']}: {record['value']}\n"
+                                elif whois_data.get('raw'):
+                                    endpoint_report_content += "  Datos WHOIS (Crudos):\n" + whois_data['raw'] + "\n"
+                                    console_summary_message += "  WHOIS (Crudos): Datos disponibles en el archivo.\n"
+                                else:
+                                    endpoint_report_content += "  No se encontraron datos WHOIS o estaban en un formato inesperado.\n"
+                                    console_summary_message += "  WHOIS: No se encontraron datos.\n"
+                                print(f"    Datos de WHOIS para '{target}' obtenidos.")
+                            else:
+                                endpoint_report_content += "  No se encontraron datos WHOIS en la respuesta.\n"
+                                console_summary_message += "  WHOIS: No se encontraron datos.\n"
+                                print(f"    No se encontraron datos de WHOIS para '{target}'.")
 
-                elif endpoint_name == "Reverse IP":
-                    reverse_ip_data = data.get('response', {})
-                    if reverse_ip_data:
-                        domains = reverse_ip_data.get('domains', [])
-                        current_summary += "  Dominios encontrados:\n"
-                        for domain_entry in domains: # Ensure iteration over actual domain entries if it's a list of dicts
-                            # Assuming 'domains' is a list of dicts like [{'name': 'domain1.com'}, {'name': 'domain2.com'}]
-                            # Or if it's a list of strings: ['domain1.com', 'domain2.com']
-                            if isinstance(domain_entry, dict) and 'name' in domain_entry:
-                                current_summary += f"    - {domain_entry['name']}\n"
-                            elif isinstance(domain_entry, str): # If it's just a list of strings
-                                current_summary += f"    - {domain_entry}\n"
-                        if not domains:
-                             current_summary += "    No se encontraron dominios en la IP inversa.\n"
-                        print(f"    Resultados de IP inversa para '{target}' obtenidos.")
-                    else:
-                        current_summary += "  No se encontraron datos de IP inversa en la respuesta.\n"
-                        print(f"    No se encontraron datos de IP inversa para '{target}'.")
+                        elif endpoint_name == "Reverse IP":
+                            reverse_ip_data = data.get('response', {})
+                            if reverse_ip_data:
+                                domains = reverse_ip_data.get('domains', [])
+                                endpoint_report_content += "  Dominios encontrados:\n"
+                                console_summary_message += f"  Reverse IP ({reverse_ip_data.get('domain_count', 0)} dominios):\n"
+                                for domain_entry in domains[:5]: # Limit console output
+                                    domain_name = domain_entry['name'] if isinstance(domain_entry, dict) else domain_entry
+                                    endpoint_report_content += f"    - {domain_name}\n"
+                                    console_summary_message += f"    - {domain_name}\n"
+                                if len(domains) > 5:
+                                    endpoint_report_content += f"    ... y {len(domains) - 5} más.\n"
+                                    console_summary_message += f"    ... y {len(domains) - 5} más (ver archivo para lista completa).\n"
+                                if not domains:
+                                     endpoint_report_content += "    No se encontraron dominios en la IP inversa.\n"
+                                     console_summary_message += "    No se encontraron dominios en la IP inversa.\n"
+                                print(f"    Resultados de IP inversa para '{target}' obtenidos.")
+                            else:
+                                endpoint_report_content += "  No se encontraron datos de IP inversa en la respuesta.\n"
+                                console_summary_message += "  Reverse IP: No se encontraron datos.\n"
+                                print(f"    No se encontraron datos de IP inversa para '{target}'.")
+                
+                except requests.exceptions.HTTPError as e_vd_http:
+                    message_vd_http = f"  Error HTTP ({endpoint_name}) al contactar ViewDNS: {e_vd_http.response.status_code} {e_vd_http.response.reason}.\n"
+                    endpoint_report_content += message_vd_http
+                    console_summary_message += message_vd_http
+                    print(message_vd_http.strip())
+                except requests.exceptions.RequestException as e_vd_req:
+                    message_vd_req = f"  Error de red ({endpoint_name}) al contactar ViewDNS: {e_vd_req}.\n"
+                    endpoint_report_content += message_vd_req
+                    console_summary_message += message_vd_req
+                    print(message_vd_req.strip())
+                except json.JSONDecodeError as e_vd_json:
+                    message_vd_json = f"  Error al decodificar JSON ({endpoint_name}) de ViewDNS: {e_vd_json}. Respuesta: {response.text[:200]}...\n"
+                    endpoint_report_content += message_vd_json
+                    console_summary_message += message_vd_json
+                    print(message_vd_json.strip())
+                except Exception as e_vd_gen:
+                    message_vd_gen = f"  Error inesperado ({endpoint_name}) durante la consulta a ViewDNS: {type(e_vd_gen).__name__} - {e_vd_gen}.\n"
+                    endpoint_report_content += message_vd_gen
+                    console_summary_message += message_vd_gen
+                    print(message_vd_gen.strip())
+                finally:
+                    endpoint_report_content += f"--- Fin de Resultados de {endpoint_name} (ViewDNS) ---\n\n"
+                    f_vd_report.write(endpoint_report_content) # Write this endpoint's content to the file
+                    print(f"  Fin de la consulta de {endpoint_name} de ViewDNS.")
+            
+            f_vd_report.write("--- Fin de Resultados de ViewDNS ---\n\n") # Overall end for ViewDNS in this file
+    
+    except IOError as e_io_vd_file:
+        io_error_msg_vd = f"Error de E/S al abrir el archivo de reporte '{output_file_path}': {e_io_vd_file}\n"
+        print(io_error_msg_vd.strip())
+        console_summary_message += io_error_msg_vd # Add to console summary
+    except Exception as e_gen_vd_outer:
+        gen_outer_error_msg_vd = f"  Error inesperado general en get_viewdns_info: {type(e_gen_vd_outer).__name__} - {e_gen_vd_outer}.\n"
+        print(gen_outer_error_msg_vd.strip())
+        console_summary_message += gen_outer_error_msg_vd
+        try:
+            with open(output_file_path, 'a', encoding='utf-8') as f_vd_report_err:
+                 f_vd_report_err.write(gen_outer_error_msg_vd + "\n--- Fin de Resultados de ViewDNS (con error) ---\n\n")
+        except Exception: # nosemgrep: generic-exception-handled
+            pass
 
-        except requests.exceptions.HTTPError as e:
-            message = f"  Error HTTP ({endpoint_name}) al contactar ViewDNS: {e.response.status_code} {e.response.reason}.\n"
-            current_summary += message
-            print(message.strip())
-        except requests.exceptions.RequestException as e:
-            message = f"  Error de red ({endpoint_name}) al contactar ViewDNS: {e}.\n"
-            current_summary += message
-            print(message.strip())
-        except json.JSONDecodeError as e_json: # Specific catch for JSON decoding errors
-            message = f"  Error al decodificar JSON ({endpoint_name}) de ViewDNS: {e_json}. Respuesta: {response.text[:200]}...\n"
-            current_summary += message
-            print(message.strip())
-        except Exception as e: # Generic catch-all for other unexpected errors
-            message = f"  Error inesperado ({endpoint_name}) durante la consulta a ViewDNS: {type(e).__name__} - {e}.\n"
-            current_summary += message
-            print(message.strip())
-        finally:
-            current_summary += f"--- Fin de Resultados de {endpoint_name} (ViewDNS) ---\n"
-            # Write the current_summary for this endpoint to the main report file
-            # The report_file_handle is passed to get_viewdns_info and should be used here
-            report_file_handle.write(current_summary) # This was missing, should write this part to file
-            # report_file_handle.write("\n\n") # Add spacing if needed, but current_summary has its own end tag.
-            summary_parts.append(current_summary.strip()) # This is for the return value, not file writing
-            print(f"  Fin de la consulta de {endpoint_name} de ViewDNS.")
-
-    # Final summary for the entire ViewDNS part (written to file after all endpoints)
-    # report_file_handle.write("--- Fin de Resultados de ViewDNS ---\n\n") # This is already handled by the loop's finally or should be
-    # The return value is what's used by display_scan_findings
-    return "\n\n".join(summary_parts)
+    if console_summary_message == f"--- Resultados de ViewDNS para '{target}' ---\n": # Only initial part
+        console_summary_message += "  No se pudo generar el resumen detallado debido a un error o falta de datos.\n"
+    return console_summary_message.strip()
 
 
 def display_scan_findings(current_scan_results):
@@ -891,11 +960,9 @@ def display_scan_findings(current_scan_results):
     if not current_scan_results.get('is_ip_address_input'):
         print(f"IP Resuelta: {current_scan_results.get('resolved_ip', 'No disponible')}")
     print(f"IP Escaneada: {current_scan_results.get('target_ip_for_scan', 'No disponible')}")
-    # report_file_name is not part of current_scan_results structure from perform_full_scan
-    # It's handled in the main block. So we should get it from the global scan_results if needed here,
-    # or ensure it's passed if this function is meant to be fully independent.
-    # For now, assuming it might be in current_scan_results or not critical for this display.
-    # print(f"Nombre del Archivo de Reporte: {current_scan_results.get('report_file_name', 'No disponible')}")
+    # MODIFIED: Display current report file name which now includes the directory
+    report_file_display = current_scan_results.get('report_file_name', 'No disponible')
+    print(f"Nombre del Archivo de Reporte: {report_file_display}")
 
 
     print("\n--- Detección de Cloudflare ---")
@@ -1094,8 +1161,8 @@ def get_dns_records(dominio):
         print(f"Error inesperado durante la resolución DNS para '{dominio}': {type(e).__name__} - {e}")
         return None
 
-
-def fetch_http_content(target_ip_for_request, port, path_segment, report_file_handle):
+# MODIFIED SIGNATURE
+def fetch_http_content(target_ip_for_request, port, path_segment, report_file_handle, base_directory):
     # Ensure path_segment starts with a slash if it's not empty
     if not path_segment.startswith('/') and path_segment:
         path_segment = '/' + path_segment
@@ -1107,24 +1174,26 @@ def fetch_http_content(target_ip_for_request, port, path_segment, report_file_ha
     url = f'{scheme}://{target_ip_for_request}:{port}{path_segment}'
 
     # Sanitize the target_ip_for_request and path_segment for filename creation
-    safe_ip_filename_part = re.sub(r'[^\w.-]', '_', target_ip_for_request)
-    # Remove leading slash for filename part if path_segment was '/'
-    safe_path_filename_part = re.sub(r'[^\w.-]', '_', path_segment.strip('/'))
-    if not safe_path_filename_part: # Default for root path
-        safe_path_filename_part = 'index'
+    safe_ip_filename_part = sanitize_filename(target_ip_for_request)
+    # For path, strip leading/trailing slashes first, then sanitize.
+    # If path_segment was just "/", strip('/') makes it empty.
+    stripped_path = path_segment.strip('/')
+    safe_path_filename_part = sanitize_filename(stripped_path if stripped_path else "index")
 
-    # Construct filename to include IP, port, and path to avoid overwrites from different targets
-    # Example: http_content_192_168_1_1_port_80_path_index.txt
-    # Example: http_content_example_com_port_443_path_robots_txt.txt
-    filename = f"http_content_{safe_ip_filename_part}_port_{port}_path_{safe_path_filename_part}.html" # Changed to .html
+
+    # Construct base filename (without directory)
+    base_filename = f"http_content_{safe_ip_filename_part}_port_{port}_path_{safe_path_filename_part}.html"
+    
+    # MODIFIED: Prepend base_directory to the base_filename
+    output_filepath = os.path.join(base_directory, base_filename)
 
     try:
         print(f"Haciendo petición HTTP(S) a {url}...")
         # Standard User-Agent, allow redirects, short timeout, disable SSL verification for direct IP/untrusted certs
         response = requests.get(url, timeout=10, allow_redirects=True, verify=False, headers={'User-Agent': 'Python Security Scanner/1.0'})
 
-        # Write to file, now using .html extension for better rendering of HTML content
-        with open(filename, 'w', encoding='utf-8') as f:
+        # MODIFIED: use output_filepath for writing
+        with open(output_filepath, 'w', encoding='utf-8') as f:
             f.write(f"<!-- URL Solicitada: {url} -->\n")
             f.write(f"<!-- Código de Estado: {response.status_code} -->\n")
             f.write("<!-- Encabezados de Respuesta:\n")
@@ -1133,25 +1202,30 @@ def fetch_http_content(target_ip_for_request, port, path_segment, report_file_ha
             f.write("-->\n\n") # End of headers comment
             f.write(response.text) # Write the actual content (could be HTML)
 
-        success_message = f"Petición a {url} realizada (código {response.status_code}). Contenido guardado en {filename}."
+        # MODIFIED: success_message should use output_filepath
+        success_message = f"Petición a {url} realizada (código {response.status_code}). Contenido guardado en {output_filepath}."
         print(success_message)
         report_file_handle.write(success_message + "\n")
         return url # Return the actual URL fetched
 
     except requests.exceptions.SSLError as e_ssl:
-        error_message = f"Error de SSL/TLS durante la petición a {url} (quizás necesita http:// en lugar de https:// o viceversa?): {e_ssl}"
-        # If it was HTTPS and failed, could try HTTP as a fallback if appropriate, but not implemented here.
+        # MODIFIED: error message references output_filepath
+        error_message = f"Error de SSL/TLS durante la petición a {url} (destino archivo: {output_filepath}): {e_ssl}"
     except requests.exceptions.ConnectionError as e_conn:
-        error_message = f"Error de conexión durante la petición a {url} (el puerto podría no estar abierto o el servidor no responde): {e_conn}"
+        # MODIFIED: error message references output_filepath
+        error_message = f"Error de conexión durante la petición a {url} (destino archivo: {output_filepath}): {e_conn}"
     except requests.exceptions.Timeout as e_timeout:
-        error_message = f"Timeout durante la petición a {url}: {e_timeout}"
+        # MODIFIED: error message references output_filepath
+        error_message = f"Timeout durante la petición a {url} (destino archivo: {output_filepath}): {e_timeout}"
     except requests.RequestException as e: # Catch other general request exceptions
-        error_message = f"Error durante la petición HTTP(S) a {url}: {type(e).__name__} - {e}"
+        # MODIFIED: error message references output_filepath
+        error_message = f"Error durante la petición HTTP(S) a {url} (destino archivo: {output_filepath}): {type(e).__name__} - {e}"
     except IOError as e_io: # Catch file writing errors
-        error_message = f"Error de E/S al intentar escribir el contenido de {url} en '{filename}': {e_io}"
-        # Still attempt to log to main report file if this happens
+        # MODIFIED: error message references output_filepath
+        error_message = f"Error de E/S al intentar escribir el contenido de {url} en '{output_filepath}': {e_io}"
     except Exception as e_gen: # Catch any other unexpected errors
-        error_message = f"Error inesperado al obtener contenido de {url}: {type(e_gen).__name__} - {e_gen}"
+        # MODIFIED: error message references output_filepath
+        error_message = f"Error inesperado al obtener contenido de {url} (destino archivo: {output_filepath}): {type(e_gen).__name__} - {e_gen}"
 
     # This block will be reached if any exception occurred
     print(error_message)
@@ -1177,12 +1251,21 @@ if __name__ == '__main__':
     # scan_results will store results from the LATEST perform_full_scan call
     # This dictionary is updated when a new scan (initial or via menu option 5) is performed.
     scan_results = {}
+    # Variable to hold the full path to the current main report file
+    # This will be updated for initial scan and when a new target is scanned (option 5)
+    current_main_report_file_path = "" 
 
     # --- Initial Target Input ---
-    ip_input = input("Ingrese la dirección IP o el dominio que desea escanear: ").strip()
-    if not ip_input:
+    ip_input_raw = input("Ingrese la dirección IP o el dominio que desea escanear: ").strip()
+    if not ip_input_raw:
         print("Error: El input no puede estar vacío. Por favor, ingrese una IP o dominio válido.")
         sys.exit(1)
+    
+    # --- Target Directory Setup (Initial Scan) ---
+    sanitized_target_name_for_dir = sanitize_filename(ip_input_raw)
+    target_directory_name = sanitized_target_name_for_dir 
+    os.makedirs(target_directory_name, exist_ok=True)
+    print(f"Directorio de resultados para '{ip_input_raw}' creado/asegurado en: {os.path.join(os.getcwd(), target_directory_name)}")
 
     # --- API Key Configuration ---
     # SecurityTrails
@@ -1201,49 +1284,48 @@ if __name__ == '__main__':
     print(f"Using {'provided' if viewdns_api_key != viewdns_api_key_default else 'default'} ViewDNS API key.")
     # --- End API Key Configuration ---
 
-    # --- Main Report File Setup ---
-    # Sanitize the initial input for a safe base filename
-    safe_report_name_base = re.sub(r'[^\w.-]', '_', ip_input)
-    if not safe_report_name_base: safe_report_name_base = "generic_scan" # Fallback if input is all special chars
-    main_report_file_name = f"report_{safe_report_name_base}.txt"
-    print(f"El informe principal se guardará en: {main_report_file_name}")
-    # scan_results['report_file_name'] = main_report_file_name # Store globally for interactive mode if needed
-
+    # --- Main Report File Setup (Initial Scan) ---
+    safe_report_name_base = sanitize_filename(ip_input_raw) # Already sanitized for dir, reuse for filename base
+    current_main_report_file_path = os.path.join(target_directory_name, f"reporte_{safe_report_name_base}.txt")
+    scan_results['report_file_name'] = current_main_report_file_path # Store full path
+    print(f"El informe principal se guardará en: {current_main_report_file_path}")
+    
     # --- Perform Initial Scan ---
     try:
-        # Open the main report file in 'w' mode for the first scan (overwrite if exists)
-        # Subsequent interactive actions will append ('a' mode)
-        with open(main_report_file_name, 'w', encoding='utf-8') as f_reporte_principal:
-            f_reporte_principal.write(f"--- Inicio del Reporte de Escaneo para: {ip_input} ---\n")
+        with open(current_main_report_file_path, 'w', encoding='utf-8') as f_reporte_principal:
+            f_reporte_principal.write(f"--- Inicio del Reporte de Escaneo para: {ip_input_raw} ---\n") # Use raw for display
+            f_reporte_principal.write(f"Directorio de resultados: {target_directory_name}\n") 
             f_reporte_principal.write(f"Clave SecurityTrails Usada: {'Sí' if securitytrails_api_key else 'No'}\n")
             f_reporte_principal.write(f"Clave VirusTotal Usada: {'Sí' if virustotal_api_key else 'No'}\n")
             f_reporte_principal.write(f"Clave ViewDNS Usada: {'Sí' if viewdns_api_key else 'No'}\n")
             f_reporte_principal.write("=======================================================\n\n")
 
-            initial_scan_data = perform_full_scan(ip_input, f_reporte_principal,
-                                                  securitytrails_api_key, virustotal_api_key, viewdns_api_key)
+            initial_scan_data = perform_full_scan(
+                ip_input_raw, # Pass raw input for API calls and display
+                f_reporte_principal,
+                securitytrails_api_key,
+                virustotal_api_key,
+                viewdns_api_key,
+                target_directory_name 
+            )
             if initial_scan_data:
-                scan_results.update(initial_scan_data) # Populate global scan_results with the latest scan
-                # Ensure original_target is correctly set from the input for this scan session
-                scan_results['original_target'] = ip_input # perform_full_scan also sets this, but good to be sure
-                print(f"Escaneo inicial para '{ip_input}' completado. Resultados guardados en {main_report_file_name}")
+                scan_results.update(initial_scan_data) 
+                scan_results['original_target'] = ip_input_raw 
+                scan_results['report_file_name'] = current_main_report_file_path 
+                print(f"Escaneo inicial para '{ip_input_raw}' completado. Resultados guardados en {current_main_report_file_path}")
             else:
-                # This case implies perform_full_scan returned None or an empty dict,
-                # meaning a very early or critical failure.
-                scan_results['original_target'] = ip_input # Still set original target
-                scan_results['error_message'] = f"El escaneo inicial para {ip_input} falló o no devolvió datos."
+                scan_results['original_target'] = ip_input_raw 
+                scan_results['error_message'] = f"El escaneo inicial para {ip_input_raw} falló o no devolvió datos."
+                scan_results['report_file_name'] = current_main_report_file_path 
                 print(scan_results['error_message'])
                 f_reporte_principal.write(f"ERROR CRÍTICO: {scan_results['error_message']}\n")
 
-            f_reporte_principal.write(f"\n--- Fin del Reporte de Escaneo para: {ip_input} ---\n")
+            f_reporte_principal.write(f"\n--- Fin del Reporte de Escaneo para: {ip_input_raw} ---\n")
 
     except IOError as e:
-        print(f"Error crítico de E/S al manejar el archivo de reporte principal {main_report_file_name}: {e}")
+        print(f"Error crítico de E/S al manejar el archivo de reporte principal {current_main_report_file_path}: {e}")
         print("No se pudieron guardar los resultados del reporte principal.")
-        # Initialize essential scan_results keys if file operations failed early
-        if 'original_target' not in scan_results: scan_results['original_target'] = ip_input
-        # scan_results['report_file_name'] might not be useful if file couldn't be opened
-        sys.exit(1) # Exit if the main report file cannot be handled
+        sys.exit(1) 
 
     # --- Interactive Mode ---
     print("\n--- Iniciando Modo Interactivo ---")
@@ -1252,96 +1334,112 @@ if __name__ == '__main__':
         choice = input("Seleccione una opción (1-6): ").strip()
 
         if choice == '1':
-            if scan_results: # Check if there are any results to display
-                display_scan_findings(scan_results) # Display findings from the latest scan
+            if scan_results: 
+                display_scan_findings(scan_results) 
             else:
                 print("No hay hallazgos de escaneo para mostrar. Realice un escaneo primero.")
         elif choice == '2':
             print("\nDEBUG: Opción 2 (Seleccionar IP para acciones) aún no implementada.")
-            # Future: Implement select_ip_for_actions(scan_results, main_report_file_name, ...)
         elif choice == '3': # Get VirusTotal report for a new, specific resource
             print("\n--- Obtener Reporte de VirusTotal (Interactivo) ---")
-            resource_vt = input("Ingrese la IP o Dominio para consultar en VirusTotal: ").strip()
-            if not resource_vt:
+            resource_vt_raw = input("Ingrese la IP o Dominio para consultar en VirusTotal: ").strip()
+            if not resource_vt_raw:
                 print("Entrada vacía. No se consultará VirusTotal.")
             elif not virustotal_api_key:
                 print("Advertencia: La clave API de VirusTotal no está disponible. No se puede consultar.")
             else:
-                try:
-                    with open(main_report_file_name, 'a', encoding='utf-8') as f_reporte_interactive:
-                        f_reporte_interactive.write(f"\n--- Reporte VirusTotal Interactivo para '{resource_vt}' (Sesión Interactiva) ---\n")
-                        # This call to get_virustotal_report will print to console AND write to file.
-                        # The returned summary is not explicitly used here, but could be if needed.
-                        vt_interactive_summary = get_virustotal_report(resource_vt, virustotal_api_key, f_reporte_interactive)
-                        # We can print the summary obtained to the console as well for immediate feedback
-                        print("\n--- Resumen de VirusTotal para Recurso Interactivo ---")
-                        print(vt_interactive_summary if vt_interactive_summary.strip() else "No se generó resumen o hubo un error.")
-                        print(f"Consulta a VirusTotal para '{resource_vt}' completada. Detalles añadidos a {main_report_file_name}.")
-                except IOError as e:
-                    print(f"Error al escribir en el archivo de reporte ({main_report_file_name}): {e}")
+                safe_resource_vt_name = sanitize_filename(resource_vt_raw)
+                interactive_vt_dir = safe_resource_vt_name # Use sanitized name for directory
+                os.makedirs(interactive_vt_dir, exist_ok=True)
+                vt_output_filename = os.path.join(interactive_vt_dir, f"virustotal_report_{safe_resource_vt_name}.txt")
+                
+                print(f"Generando reporte de VirusTotal para '{resource_vt_raw}' en: {vt_output_filename}")
+                vt_interactive_summary = get_virustotal_report(resource_vt_raw, virustotal_api_key, vt_output_filename) # Pass raw for API
+                
+                print("\n--- Resumen de VirusTotal para Recurso Interactivo ---")
+                print(vt_interactive_summary if vt_interactive_summary.strip() else "No se generó resumen o hubo un error.")
+                print(f"Consulta a VirusTotal para '{resource_vt_raw}' completada. Reporte detallado guardado en {vt_output_filename}.")
+
         elif choice == '4': # Get ViewDNS info for a new, specific resource
             print("\n--- Obtener Información de ViewDNS (Interactivo) ---")
-            resource_vd = input("Ingrese la IP o Dominio para consultar en ViewDNS: ").strip()
-            if not resource_vd:
+            resource_vd_raw = input("Ingrese la IP o Dominio para consultar en ViewDNS: ").strip()
+            if not resource_vd_raw:
                 print("Entrada vacía. No se consultará ViewDNS.")
             elif not viewdns_api_key:
                 print("Advertencia: La clave API de ViewDNS no está disponible. No se puede consultar.")
             else:
-                try:
-                    with open(main_report_file_name, 'a', encoding='utf-8') as f_reporte_interactive:
-                        f_reporte_interactive.write(f"\n--- Información ViewDNS Interactiva para '{resource_vd}' (Sesión Interactiva) ---\n")
-                        # get_viewdns_info writes to file and returns a summary string.
-                        vd_interactive_summary = get_viewdns_info(resource_vd, viewdns_api_key, f_reporte_interactive)
-                        print("\n--- Resumen de ViewDNS para Recurso Interactivo ---")
-                        print(vd_interactive_summary if vd_interactive_summary.strip() else "No se generó resumen o hubo un error.")
-                        print(f"Consulta a ViewDNS para '{resource_vd}' completada. Detalles añadidos a {main_report_file_name}.")
-                except IOError as e:
-                    print(f"Error al escribir en el archivo de reporte ({main_report_file_name}): {e}")
+                safe_resource_vd_name = sanitize_filename(resource_vd_raw)
+                interactive_vd_dir = safe_resource_vd_name # Use sanitized name for directory
+                os.makedirs(interactive_vd_dir, exist_ok=True)
+                vd_output_filename = os.path.join(interactive_vd_dir, f"viewdns_report_{safe_resource_vd_name}.txt")
+
+                print(f"Generando reporte de ViewDNS para '{resource_vd_raw}' en: {vd_output_filename}")
+                vd_interactive_summary = get_viewdns_info(resource_vd_raw, viewdns_api_key, vd_output_filename) # Pass raw for API
+
+                print("\n--- Resumen de ViewDNS para Recurso Interactivo ---")
+                print(vd_interactive_summary if vd_interactive_summary.strip() else "No se generó resumen o hubo un error.")
+                print(f"Consulta a ViewDNS para '{resource_vd_raw}' completada. Reporte detallado guardado en {vd_output_filename}.")
+
         elif choice == '5': # Scan a new target
             print("\n--- Escanear Nuevo Objetivo ---")
-            new_target_input = input("Ingrese la nueva IP o Dominio a escanear: ").strip()
-            if not new_target_input:
+            new_target_input_raw = input("Ingrese la nueva IP o Dominio a escanear: ").strip()
+            if not new_target_input_raw:
                 print("Entrada vacía. No se escaneará un nuevo objetivo.")
             else:
-                ip_input = new_target_input # Update the main target reference
-                print(f"Iniciando nuevo escaneo para '{ip_input}'. Los resultados se añadirán a {main_report_file_name}")
+                ip_input_raw = new_target_input_raw # Update current target reference (raw for APIs/display)
+                
+                safe_new_target_name = sanitize_filename(new_target_input_raw)
+                target_directory_name = safe_new_target_name # Use sanitized for directory
+                os.makedirs(target_directory_name, exist_ok=True)
+                print(f"Directorio de resultados para nuevo objetivo '{ip_input_raw}' creado/asegurado en: {os.path.join(os.getcwd(), target_directory_name)}")
+
+                current_main_report_file_path = os.path.join(target_directory_name, f"reporte_{safe_new_target_name}.txt")
+                scan_results['report_file_name'] = current_main_report_file_path 
+                
+                print(f"Iniciando nuevo escaneo para '{ip_input_raw}'. Los resultados se guardarán en {current_main_report_file_path}")
                 try:
-                    with open(main_report_file_name, 'a', encoding='utf-8') as f_reporte_interactive:
-                        f_reporte_interactive.write(f"\n\n=== INICIO DE NUEVO ESCANEO INTERACTIVO PARA: {ip_input} ===\n")
+                    with open(current_main_report_file_path, 'w', encoding='utf-8') as f_reporte_interactive:
+                        f_reporte_interactive.write(f"\n\n=== INICIO DE NUEVO ESCANEO INTERACTIVO PARA: {ip_input_raw} ===\n") # Use raw for display
+                        f_reporte_interactive.write(f"Directorio de resultados: {target_directory_name}\n")
                         f_reporte_interactive.write(f"Clave SecurityTrails Usada: {'Sí' if securitytrails_api_key else 'No'}\n")
                         f_reporte_interactive.write(f"Clave VirusTotal Usada: {'Sí' if virustotal_api_key else 'No'}\n")
                         f_reporte_interactive.write(f"Clave ViewDNS Usada: {'Sí' if viewdns_api_key else 'No'}\n")
                         f_reporte_interactive.write("=======================================================\n\n")
 
-                        # Perform the new full scan
-                        new_scan_data = perform_full_scan(ip_input, f_reporte_interactive,
-                                                          securitytrails_api_key, virustotal_api_key, viewdns_api_key)
+                        new_scan_data = perform_full_scan(
+                            ip_input_raw, # Pass raw for APIs/display
+                            f_reporte_interactive,
+                            securitytrails_api_key,
+                            virustotal_api_key,
+                            viewdns_api_key,
+                            target_directory_name 
+                        )
                         if new_scan_data:
-                            scan_results.clear() # Clear previous scan results
-                            scan_results.update(new_scan_data) # Update global scan_results with the new scan
-                            scan_results['original_target'] = ip_input # Ensure original_target is updated
-                            print(f"Nuevo escaneo para '{ip_input}' completado. 'Listar todos los hallazgos' ahora mostrará estos resultados.")
+                            scan_results.clear() 
+                            scan_results.update(new_scan_data) 
+                            scan_results['original_target'] = ip_input_raw 
+                            scan_results['report_file_name'] = current_main_report_file_path 
+                            print(f"Nuevo escaneo para '{ip_input_raw}' completado. 'Listar todos los hallazgos' ahora mostrará estos resultados.")
                         else:
-                            # Handle critical failure of the new scan
-                            error_msg_new_scan = f"El nuevo escaneo para '{ip_input}' falló o no devolvió datos."
-                            scan_results['original_target'] = ip_input # Update target even if scan failed
-                            scan_results['error_message'] = error_msg_new_scan
-                            print(error_msg_new_scan)
-                            f_reporte_interactive.write(f"ERROR CRÍTICO (nuevo escaneo): {error_msg_new_scan}\n")
+                            scan_results['original_target'] = ip_input_raw 
+                            scan_results['error_message'] = f"El nuevo escaneo para '{ip_input_raw}' falló o no devolvió datos."
+                            scan_results['report_file_name'] = current_main_report_file_path 
+                            print(scan_results['error_message'])
+                            f_reporte_interactive.write(f"ERROR CRÍTICO (nuevo escaneo): {scan_results['error_message']}\n") 
 
-                        f_reporte_interactive.write(f"\n=== FIN DE NUEVO ESCANEO INTERACTIVO PARA: {ip_input} ===\n")
+                        f_reporte_interactive.write(f"\n=== FIN DE NUEVO ESCANEO INTERACTIVO PARA: {ip_input_raw} ===\n")
                 except IOError as e:
-                    print(f"Error al abrir o escribir en el archivo de reporte {main_report_file_name}: {e}")
+                    print(f"Error al abrir o escribir en el archivo de reporte {current_main_report_file_path}: {e}")
         elif choice == '6':
             print("\nSaliendo del modo interactivo...")
             break
         else:
             print("\nOpción no válida. Por favor, intente de nuevo.")
 
-        if choice != '6': # Don't ask for "Enter to continue" if exiting
+        if choice != '6': 
             try:
                 input("\nPresione Enter para continuar...")
-            except EOFError: # Handle EOF if input stream is closed (e.g. piping input)
+            except EOFError: 
                 print("\nEOF detectado, saliendo...")
                 break
 
