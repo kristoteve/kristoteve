@@ -51,6 +51,16 @@ SERVICE_PREFIXES = [ # As per task description
     'dns', 'dns1', 'dns2', 'ns', 'ns1', 'ns2', 'smtp', 'pop', 'imap', 'admin', 'owa', 'portal'
 ]
 
+def display_interactive_menu():
+    print("\n--- Menú Interactivo ---")
+    print("1. Listar todos los hallazgos del escaneo actual")
+    print("2. Seleccionar una IP específica para acciones adicionales")
+    print("3. Obtener reporte de VirusTotal para un nuevo IP/Dominio")
+    print("4. Obtener información de ViewDNS para un nuevo IP/Dominio")
+    print("5. Escanear un nuevo objetivo")
+    print("6. Salir")
+    print("------------------------")
+
 # --- Definition of perform_full_scan function ---
 def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_key, vd_api_key):
     current_run_results = {}
