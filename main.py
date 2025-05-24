@@ -97,7 +97,7 @@ def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_
     # Determine if input is an IP address or a hostname
     is_ip_address_local = False
     resolved_ip_local = None
-    target_ip_for_scan_local = ""
+    target_ip_for_scan_local = "" # This is the initially resolved IP or the input IP
 
     try:
         socket.inet_aton(dominio_for_report)
@@ -110,23 +110,26 @@ def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_
         target_ip_for_scan_local = dominio_for_report
     else:
         print(f"Input '{dominio_for_report}' parece ser un nombre de host. Intentando resolución DNS...")
-        resolved_ip_local = get_dns_records(dominio_for_report) # Uses existing global get_dns_records
+        resolved_ip_local = get_dns_records(dominio_for_report) 
         if not resolved_ip_local:
             message = f"Error: Fallo en la resolución DNS para '{dominio_for_report}'. No se puede continuar el escaneo para este objetivo.\n"
             print(message.strip())
             main_report_file_handle.write(message)
             current_run_results['is_ip_address_input'] = is_ip_address_local
             current_run_results['resolved_ip'] = resolved_ip_local
-            current_run_results['target_ip_for_scan'] = None
+            current_run_results['target_ip_for_scan'] = None # Set to None explicitly
+            current_run_results['ips_targeted_for_scan'] = []
+            current_run_results['open_ports'] = {}
             main_report_file_handle.write(f"--- Fin del Escaneo Detallado para '{dominio_for_report}' (Fallo Temprano) ---\n\n")
-            return current_run_results # Return partially filled results
+            return current_run_results 
 
         print(f"Nombre de host '{dominio_for_report}' resuelto a IP: {resolved_ip_local}")
         target_ip_for_scan_local = resolved_ip_local
 
     current_run_results['is_ip_address_input'] = is_ip_address_local
     current_run_results['resolved_ip'] = resolved_ip_local
-    current_run_results['target_ip_for_scan'] = target_ip_for_scan_local
+    # target_ip_for_scan_local now holds the IP to be used if not behind Cloudflare or if input is IP
+    current_run_results['target_ip_for_scan'] = target_ip_for_scan_local 
 
     # Log DNS resolution details if input was a hostname
     if not is_ip_address_local and resolved_ip_local:
@@ -136,11 +139,6 @@ def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_
 
     # Subdomain search (only if the original input was not an IP)
     all_discovered_subdomains_set_local = set()
-    subdomains_found_ct_results_local = []
-    subdomains_found_dns_results_local = []
-    potential_origin_ips_history_local = []
-    potential_origin_ips_services_local = []
-
     if not is_ip_address_local:
         print(f"\n--- Buscando subdominios para '{dominio_for_report}' vía crt.sh ---")
         subdomains_found_ct_results_local = find_subdomains_ct(dominio_for_report)
@@ -171,7 +169,7 @@ def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_
 
     # Cloudflare Check
     print(f"\n--- Verificando Cloudflare para '{dominio_for_report}' ---")
-    cloudflare_results_local = check_cloudflare(dominio_for_report)
+    cloudflare_results_local = check_cloudflare(dominio_for_report) # Pass original domain or IP
     current_run_results['cloudflare_results'] = cloudflare_results_local
     main_report_file_handle.write(f"--- Resultados de la Verificación de Cloudflare para '{dominio_for_report}' ---\n")
     main_report_file_handle.write(f"¿Detrás de Cloudflare?: {'Sí' if cloudflare_results_local.get('is_cloudflare') else 'No'}\n")
@@ -183,7 +181,7 @@ def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_
 
     # Origin IP Search (if not IP)
     consolidated_potential_origin_ips_set_local = set()
-    if not is_ip_address_local:
+    if not is_ip_address_local: # Only for domain inputs
         print(f"\n--- Buscando IPs de origen (historial DNS) para '{dominio_for_report}' vía SecurityTrails ---")
         potential_origin_ips_history_local = find_origin_ip_dns_history(dominio_for_report, st_api_key)
         main_report_file_handle.write(f"--- IPs de Origen Potenciales (Historial DNS - SecurityTrails) para '{dominio_for_report}' ---\n")
@@ -200,7 +198,7 @@ def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_
         else: main_report_file_handle.write("No se encontraron IPs de origen potenciales vía servicios DNS relacionados.\n")
         main_report_file_handle.write("--- Fin de Búsqueda de IPs de Origen (Servicios Relacionados DNS) ---\n\n")
 
-        if cloudflare_results_local.get('is_cloudflare'):
+        if cloudflare_results_local.get('is_cloudflare'): # Only consolidate if behind Cloudflare
             if potential_origin_ips_history_local: consolidated_potential_origin_ips_set_local.update(potential_origin_ips_history_local)
             if potential_origin_ips_services_local: consolidated_potential_origin_ips_set_local.update(potential_origin_ips_services_local)
             main_report_file_handle.write(f"--- Lista Consolidada de IPs de Origen Potenciales (No Cloudflare) para '{dominio_for_report}' ---\n")
@@ -209,43 +207,81 @@ def perform_full_scan(target_input, main_report_file_handle, st_api_key, vt_api_
                 for ip_origin in sorted(list(consolidated_potential_origin_ips_set_local)): main_report_file_handle.write(f"  - {ip_origin}\n")
             else: main_report_file_handle.write("No se encontraron IPs de origen potenciales.\n")
             main_report_file_handle.write("--- Fin de Lista Consolidada de IPs de Origen ---\n\n")
-        else:
-            main_report_file_handle.write(f"--- Búsqueda de IP de Origen para '{dominio_for_report}' ---\n")
-            main_report_file_handle.write("Cloudflare no fue detectado, la búsqueda específica de IP de origen no fue realizada.\n")
-            main_report_file_handle.write("--- Fin de Búsqueda de IP de Origen ---\n\n")
-
     current_run_results['consolidated_potential_origin_ips'] = sorted(list(consolidated_potential_origin_ips_set_local))
 
-    # VirusTotal and ViewDNS reports
-    # Use sanitized name for filenames
+
+    # --- IP Selection for Port Scan ---
+    ips_to_actually_scan = []
+    main_report_file_handle.write("--- Selección de IP para Escaneo de Puertos y Ping ---\n")
+    if not is_ip_address_local: # Domain input
+        if cloudflare_results_local.get('is_cloudflare') and consolidated_potential_origin_ips_set_local:
+            ips_to_actually_scan.extend(list(consolidated_potential_origin_ips_set_local))
+            main_report_file_handle.write(f"Cloudflare detectado. El escaneo de puertos y ping se realizará sobre las IPs de origen identificadas: {', '.join(ips_to_actually_scan)}\n")
+        else: 
+            if target_ip_for_scan_local: 
+                ips_to_actually_scan.append(target_ip_for_scan_local)
+                if cloudflare_results_local.get('is_cloudflare'):
+                     main_report_file_handle.write(f"Cloudflare detectado, pero no se encontraron IPs de origen. El escaneo se realizará sobre la IP resuelta (potencialmente Cloudflare): {target_ip_for_scan_local}\n")
+                else:
+                     main_report_file_handle.write(f"Cloudflare no detectado. El escaneo de puertos y ping se realizará sobre la IP resuelta: {target_ip_for_scan_local}\n")
+            else:
+                main_report_file_handle.write("No se pudo determinar una IP para el escaneo de puertos (falló la resolución inicial y no es Cloudflare o no hay origen).\n")
+    else: # IP input
+        if target_ip_for_scan_local: 
+            ips_to_actually_scan.append(target_ip_for_scan_local)
+            main_report_file_handle.write(f"La entrada es una IP. El escaneo de puertos y ping se realizará sobre: {target_ip_for_scan_local}\n")
+        else: 
+            main_report_file_handle.write("La entrada es una IP pero target_ip_for_scan_local está vacío. No se puede escanear puertos.\n")
+    main_report_file_handle.write("--- Fin de Selección de IP ---\n\n")
+    
+    current_run_results['ips_targeted_for_scan'] = ips_to_actually_scan 
+
+    # VirusTotal and ViewDNS reports (done on the original target_input)
     vt_report_filename = os.path.join(base_directory, f"virustotal_report_{sanitized_dominio_for_filenames}.txt")
-    current_run_results['virustotal_summary'] = get_virustotal_report(dominio_for_report, vt_api_key, vt_report_filename) # Pass original for API
+    current_run_results['virustotal_summary'] = get_virustotal_report(dominio_for_report, vt_api_key, vt_report_filename) 
     main_report_file_handle.write(f"Reporte de VirusTotal para '{dominio_for_report}' generado en: {vt_report_filename}\n")
 
     vd_report_filename = os.path.join(base_directory, f"viewdns_report_{sanitized_dominio_for_filenames}.txt")
-    current_run_results['viewdns_summary'] = get_viewdns_info(dominio_for_report, vd_api_key, vd_report_filename) # Pass original for API
-    main_report_file_handle.write(f"Reporte de ViewDNS para '{dominio_for_report}' generado en: {vd_report_filename}\n")
+    current_run_results['viewdns_summary'] = get_viewdns_info(dominio_for_report, vd_api_key, vd_report_filename) 
+    main_report_file_handle.write(f"Reporte de ViewDNS para '{dominio_for_report}' generado en: {vd_report_filename}\n\n")
 
-    # Ping Check
-    check_reachability_with_ping(target_ip_for_scan_local, main_report_file_handle)
 
-    # Port Scan
-    main_report_file_handle.write("--- Resultados del Escaneo de Puertos con Nmap ---\n")
-    open_ports_list_local = scan_ports(target_ip_for_scan_local)
-    current_run_results['open_ports'] = open_ports_list_local if open_ports_list_local else []
-    if open_ports_list_local:
-        main_report_file_handle.write(f"Puertos abiertos encontrados en {target_ip_for_scan_local}:\n")
-        for port in open_ports_list_local: main_report_file_handle.write(f"  {port}/tcp - Abierto\n")
+    # --- Ping Check & Port Scan Loop ---
+    current_run_results['open_ports'] = {} # Initialize as a dictionary
 
-        main_report_file_handle.write("\n--- Intentando obtener contenido HTTP de puertos abiertos ---\n")
-        paths_to_check = ["/", "/robots.txt", "/sitemap.xml"]
-        for port_num in open_ports_list_local:
-            if port_num == 80 or port_num == 443 or port_num >= 8000:
-                for path_segment in paths_to_check:
-                    fetch_http_content(target_ip_for_scan_local, port_num, path_segment, main_report_file_handle, base_directory)
+    if not ips_to_actually_scan:
+        main_report_file_handle.write("--- Escaneo de Puertos y Ping ---\n")
+        main_report_file_handle.write("No hay IPs válidas para realizar el escaneo de puertos o ping.\n")
+        main_report_file_handle.write("--- Fin de Escaneo de Puertos y Ping ---\n\n")
     else:
-        main_report_file_handle.write(f"No se encontraron puertos abiertos o hubo un error durante el escaneo en {target_ip_for_scan_local}.\n")
-    main_report_file_handle.write("--- Fin de Resultados del Escaneo de Puertos ---\n\n")
+        main_report_file_handle.write("--- Escaneo de Puertos y Ping Detallado ---\n")
+        for current_ip_being_scanned in ips_to_actually_scan:
+            main_report_file_handle.write(f"\n--- Detalles para IP: {current_ip_being_scanned} ---\n")
+            
+            check_reachability_with_ping(current_ip_being_scanned, main_report_file_handle) # Ping this specific IP
+
+            main_report_file_handle.write(f"--- Resultados del Escaneo de Puertos con Nmap para {current_ip_being_scanned} ---\n")
+            open_ports_for_current_ip = scan_ports(current_ip_being_scanned)
+            # Store even if empty, to indicate scan was attempted for this IP
+            current_run_results['open_ports'][current_ip_being_scanned] = open_ports_for_current_ip if open_ports_for_current_ip else []
+
+
+            if open_ports_for_current_ip:
+                main_report_file_handle.write(f"Puertos abiertos encontrados en {current_ip_being_scanned}:\n")
+                for port in open_ports_for_current_ip:
+                    main_report_file_handle.write(f"  {port}/tcp - Abierto\n")
+
+                main_report_file_handle.write(f"\n--- Intentando obtener contenido HTTP de puertos abiertos en {current_ip_being_scanned} ---\n")
+                paths_to_check = ["/", "/robots.txt", "/sitemap.xml"] 
+                for port_num in open_ports_for_current_ip:
+                    if port_num == 80 or port_num == 443 or port_num >= 8000: 
+                        for path_segment in paths_to_check:
+                            fetch_http_content(current_ip_being_scanned, port_num, path_segment, main_report_file_handle, base_directory) 
+            else:
+                main_report_file_handle.write(f"No se encontraron puertos abiertos o hubo un error durante el escaneo en {current_ip_being_scanned}.\n")
+            main_report_file_handle.write(f"--- Fin de Resultados del Escaneo de Puertos para {current_ip_being_scanned} ---\n")
+        main_report_file_handle.write("\n--- Fin de Escaneo de Puertos y Ping Detallado ---\n\n")
+
 
     main_report_file_handle.write(f"\nEscaneo detallado para '{dominio_for_report}' finalizado.\n")
     main_report_file_handle.write(f"--- Fin del Escaneo Detallado para '{dominio_for_report}' ---\n\n")
@@ -586,7 +622,7 @@ def check_related_services_dns(target_domain, subdomains_found=None):
 # MODIFIED SIGNATURE: Takes output_file_path instead of report_file_handle
 def get_virustotal_report(resource, api_key, output_file_path):
     print(f"\n--- Obteniendo reporte de VirusTotal para '{resource}' ---")
-    console_summary_message = f"  Resumen de VirusTotal para '{resource}':\n"
+    console_summary_message = f"  Resumen de VirusTotal para '{resource}':\n" 
     web_scraping_summary_message = "  Web scraping para datos de relaciones detalladas: No intentado.\n" # Default
     gui_link_relations = "" 
     is_ip = False 
@@ -936,11 +972,19 @@ def display_scan_findings(current_scan_results):
     print(f"Objetivo Original: {current_scan_results.get('original_target', 'No disponible')}")
     print(f"Es IP de entrada: {'Sí' if current_scan_results.get('is_ip_address_input') else 'No'}")
     if not current_scan_results.get('is_ip_address_input'):
-        print(f"IP Resuelta: {current_scan_results.get('resolved_ip', 'No disponible')}")
-    print(f"IP Escaneada: {current_scan_results.get('target_ip_for_scan', 'No disponible')}")
-    # MODIFIED: Display current report file name which now includes the directory
+        print(f"IP Resuelta (inicial): {current_scan_results.get('resolved_ip', 'No disponible')}") 
+    
+    ips_scanned_for_ports = current_scan_results.get('ips_targeted_for_scan', [])
+    if ips_scanned_for_ports:
+        print(f"IPs Escaneadas para Puertos/Ping: {', '.join(ips_scanned_for_ports)}")
+    else: 
+        # Fallback if 'ips_targeted_for_scan' is empty or not present
+        alt_ip_display = current_scan_results.get('target_ip_for_scan', 'No disponible/No aplica')
+        print(f"IP Escaneada (Principal): {alt_ip_display}")
+
+
     report_file_display = current_scan_results.get('report_file_name', 'No disponible')
-    print(f"Nombre del Archivo de Reporte: {report_file_display}")
+    print(f"Nombre del Archivo de Reporte Principal: {report_file_display}")
 
 
     print("\n--- Detección de Cloudflare ---")
@@ -950,12 +994,12 @@ def display_scan_findings(current_scan_results):
         print("Evidencia:")
         for ev in cf_results.get('evidence', []):
             print(f"  - {ev}")
-    elif not cf_results: # If cf_results itself is missing or empty
+    elif not cf_results: 
             print("Resultados de Cloudflare no disponibles o no se ejecutó la verificación.")
 
     print("\n--- Subdominios Descubiertos ---")
     subdomains = current_scan_results.get('all_discovered_subdomains', [])
-    if subdomains: # Check if list is not empty
+    if subdomains: 
         for sub in subdomains:
             print(f"  - {sub}")
     else:
@@ -963,24 +1007,28 @@ def display_scan_findings(current_scan_results):
 
     print("\n--- IPs de Origen Potenciales (No Cloudflare) ---")
     origin_ips = current_scan_results.get('consolidated_potential_origin_ips', [])
-    if origin_ips: # Check if list is not empty
+    if origin_ips: 
         for ip_origin in origin_ips:
             print(f"  - {ip_origin}")
     else:
         print("No se encontraron IPs de origen potenciales, el objetivo no está detrás de Cloudflare, o la búsqueda no aplicó.")
 
-    print("\n--- Puertos Abiertos en el Objetivo Principal ---")
-    open_ports = current_scan_results.get('open_ports', [])
-    if open_ports: # Check if list is not empty
-        for port in open_ports:
-            print(f"  - {port}/tcp")
+    print("\n--- Puertos Abiertos ---")
+    open_ports_data = current_scan_results.get('open_ports', {}) # This is now a dict
+    if open_ports_data:
+        for ip_addr, ports in open_ports_data.items():
+            if ports:
+                print(f"  IP: {ip_addr}")
+                for port in ports:
+                    print(f"    - {port}/tcp")
+            else:
+                print(f"  IP: {ip_addr} - No se encontraron puertos abiertos o el escaneo falló.")
     else:
-        print("No se encontraron puertos abiertos o el escaneo de puertos falló/no se ejecutó.")
+        print("No se encontraron puertos abiertos en ninguna IP objetivo o el escaneo de puertos falló/no se ejecutó.")
+
 
     print("\n--- Resumen de VirusTotal ---")
-    # The get_virustotal_report function now returns a string which is the summary.
     vt_summary = current_scan_results.get('virustotal_summary', "Resumen de VirusTotal no disponible.")
-    # Ensure vt_summary is a string before calling strip()
     if isinstance(vt_summary, str) and vt_summary.strip():
         print(vt_summary)
     else:
@@ -989,7 +1037,7 @@ def display_scan_findings(current_scan_results):
 
     print("\n--- Resumen de ViewDNS ---")
     vd_summary = current_scan_results.get('viewdns_summary', "Resumen de ViewDNS no disponible.")
-    if isinstance(vd_summary, str) and vd_summary.strip():
+    if isinstance(vd_summary, str) and vd_summary.strip(): # Corrected typo here
         print(vd_summary)
     else:
         print("Resumen de ViewDNS no disponible o no se ejecutó.")
@@ -1004,52 +1052,42 @@ def scan_ports(ip):
         return []
 
     try:
-        # Comando nmap con escaneo SYN (-sS), T4 timing, sin ping (-Pn), para todos los puertos (--open para mostrar solo abiertos)
-        # Consider adding -v for verbosity if needed for debugging, but it adds noise.
-        # Ensure --open is used to only get open ports, simplifying parsing.
-        # Using -p- for all 65535 ports. This can be slow.
-        # For faster scans, one might specify common ports e.g., -p 1-1024,4444,8080 or use --top-ports 1000
-        # Current command: nmap -sS -T4 -Pn -p- --open <IP>
         result = subprocess.check_output(
             ['nmap', '-sS', '-T4', '-Pn', '-p-', '--open', ip],
             universal_newlines=True,
-            stderr=subprocess.PIPE # Capture stderr for better error reporting
+            stderr=subprocess.PIPE 
         )
 
         open_ports = []
         for line in result.splitlines():
-            # Example Nmap output line for an open port: "80/tcp open  http"
             if "/tcp" in line and "open" in line:
                 try:
                     port_str = line.split('/')[0]
-                    if port_str.isdigit(): # Ensure it's a number before converting
+                    if port_str.isdigit(): 
                         port = int(port_str)
-                        print(f"Puerto {port}/tcp abierto")
+                        print(f"Puerto {port}/tcp abierto en {ip}")
                         open_ports.append(port)
                 except (IndexError, ValueError) as e:
                     print(f"  Advertencia: No se pudo analizar la línea de puerto de nmap: '{line}'. Error: {e}")
-                    continue # Skip to next line
+                    continue 
 
         if not open_ports:
             print(f"No se encontraron puertos TCP abiertos para {ip} o nmap no los reportó en el formato esperado.")
 
         return open_ports
 
-    except FileNotFoundError: # Specific error for nmap not being installed/found
+    except FileNotFoundError: 
         print("Error: Comando nmap no encontrado. Por favor, asegúrese de que nmap esté instalado y en el PATH del sistema.")
         return []
     except subprocess.CalledProcessError as e:
-        # This error means nmap ran but returned a non-zero exit code.
-        # e.output might contain partial results or info, e.g. if host is down and -Pn was used.
-        # e.stderr often contains the actual error message from nmap.
         error_message = f"Error durante el escaneo de nmap para {ip}. Código de salida: {e.returncode}."
-        if e.stdout: # Nmap might print to stdout even on error
+        if e.stdout: 
             error_message += f" Salida de Nmap (stdout): {e.stdout.strip()}"
-        if e.stderr: # Nmap often prints errors to stderr
+        if e.stderr: 
             error_message += f" Salida de Nmap (stderr): {e.stderr.strip()}"
         print(error_message)
         return []
-    except Exception as e: # Catch any other unexpected exceptions
+    except Exception as e: 
         print(f"Error inesperado durante el escaneo de puertos para {ip}: {type(e).__name__} - {e}")
         return []
 
@@ -1058,27 +1096,20 @@ def check_reachability_with_ping(target_ip, report_file_handle):
     print(f"Intentando hacer ping a {target_ip}...")
     report_file_handle.write(f"--- Resultados del Ping a {target_ip} ---\n")
     try:
-        # Ping with 1 packet (-c 1 for Linux/macOS, -n 1 for Windows)
-        # Timeout for reply: -W 2 (Linux/macOS), -w 2000 (Windows, in ms)
-        # Platform specific ping command
         if sys.platform.startswith('win'):
             command = ["ping", "-n", "1", "-w", "2000", target_ip]
-        else: # Linux, macOS, etc.
+        else: 
             command = ["ping", "-c", "1", "-W", "2", target_ip]
 
         ping_output = subprocess.check_output(
             command,
-            universal_newlines=True, # Decodes output to string
-            timeout=5,  # Overall timeout for the subprocess call itself
-            stderr=subprocess.PIPE # Capture stderr
+            universal_newlines=True, 
+            timeout=5,  
+            stderr=subprocess.PIPE 
         )
 
-        # Try to find a canonical name if target_ip was an IP that resolved from a name
-        # This is often present in the first line of ping output on some systems
         canonical_name_found = None
         first_line = ping_output.splitlines()[0] if ping_output.splitlines() else ""
-        # Example: "PING google.com (142.250.195.174) 56(84) bytes of data."
-        # Regex to capture the name if it's different from target_ip
         match = re.search(r"PING\s+([\w.-]+)\s+\(([^)]+)\)", first_line)
         if match:
             name_in_ping = match.group(1)
@@ -1097,23 +1128,22 @@ def check_reachability_with_ping(target_ip, report_file_handle):
         report_file_handle.write("Salida completa del ping:\n" + ping_output + "\n")
 
     except subprocess.CalledProcessError as e:
-        # Ping command ran but returned a non-zero exit code (e.g., host unreachable)
         message = f"No se pudo hacer ping a {target_ip} (Respuesta no exitosa o error de comando).\n"
-        if e.stdout: # Sometimes output is on stdout even for errors
+        if e.stdout: 
             message += f"Salida de Ping (stdout): {e.stdout.strip()}\n"
-        if e.stderr: # Error messages often go to stderr
+        if e.stderr: 
             message += f"Salida de Ping (stderr): {e.stderr.strip()}\n"
         print(f"No se pudo hacer ping a {target_ip}.")
         report_file_handle.write(message)
-    except FileNotFoundError: # Ping command itself not found
+    except FileNotFoundError: 
         message = f"Comando 'ping' no encontrado. No se pudo verificar la alcanzabilidad para {target_ip}. Asegúrese de que 'ping' esté en el PATH del sistema.\n"
         print("Error: Comando 'ping' no encontrado.")
         report_file_handle.write(message)
-    except subprocess.TimeoutExpired: # Overall subprocess call timed out
+    except subprocess.TimeoutExpired: 
         message = f"Ping a {target_ip} timed out (límite de tiempo del subproceso excedido).\n"
         print(f"Ping a {target_ip} timed out.")
         report_file_handle.write(message)
-    except Exception as e: # Catch any other unexpected exceptions
+    except Exception as e: 
         message = f"Error inesperado durante el ping a {target_ip}: {type(e).__name__} - {e}.\n"
         print(f"Error inesperado durante el ping: {e}")
         report_file_handle.write(message)
@@ -1124,18 +1154,14 @@ def check_reachability_with_ping(target_ip, report_file_handle):
 def get_dns_records(dominio):
     try:
         print(f"Realizando consulta DNS para {dominio}...")
-        # socket.gethostbyname only returns one IP address for an A record.
-        # For more comprehensive DNS info (like multiple A records, MX, NS, etc.),
-        # dnspython should be used more extensively if needed elsewhere.
-        # Here, it's used for a basic A record lookup.
         ip_address = socket.gethostbyname(dominio)
         print(f"Dirección IP para {dominio}: {ip_address}")
         return ip_address
-    except socket.gaierror as e: # Specific error for DNS resolution failures
+    except socket.gaierror as e: 
         print(f"No se pudo resolver el DNS para '{dominio}'. Error: {e}. "
               "Verifique que el nombre de dominio sea correcto y que tenga conexión a internet.")
         return None
-    except Exception as e: # Catch any other unexpected errors
+    except Exception as e: 
         print(f"Error inesperado durante la resolución DNS para '{dominio}': {type(e).__name__} - {e}")
         return None
 
