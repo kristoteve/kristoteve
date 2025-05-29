@@ -13,6 +13,7 @@ import re
 import secrets
 import hashlib
 import urllib.parse
+import requests
 import site
 import random
 import struct
@@ -32,13 +33,13 @@ def install(package):
 
 # Versuchen Sie, die Module zu importieren, und installieren Sie sie, wenn sie fehlen
 try:
-    import user_agent
-    import fake_useragent
+    from fake_useragent import UserAgent
+    import user_agent # Though user_agent itself is not directly used later, it's imported alongside fake_useragent
 except ImportError:
-    install('user_agent')
+    install('user_agent') # user_agent is often a dependency or alternative for fake_useragent
     install('fake_useragent')
+    from fake_useragent import UserAgent
     import user_agent
-    import fake_useragent
 #tst222
 k=""
 class Glb:
@@ -74,8 +75,6 @@ class Glb:
     play_sound = False
     result_logger = None
     soundPath = ''
-
-    from fake_useragent import UserAgent
 
     # Create a new UserAgent object
     ua = UserAgent()
@@ -567,9 +566,8 @@ class Modules:
 
     def __init__(self):  # macCombo, user, pwd):
         """This section could be edit if you want to add more modules/script/method according to your needs"""
-        import requests as http
         Requirements().selfcheck()
-        self.requests = http
+        self.requests = requests # Use the top-level import
         self.myHeaders = {'Connection': "keep-alive", 'Accept': "*/*; charset=utf-8",
                           'Accept-Encoding': "gzip, deflate"}
         self.hand_shake = 'stb&action=handshake&token=&prehash=0&JsHttpRequest=1-xml'
@@ -652,11 +650,13 @@ class Modules:
                                 cate_list2 = sorted(set(Parse().parse_btw_rec(all_cat, '">', '</a>')))
                                 try:
                                     cate_list2.remove("All")
-                                except:
+                                except ValueError: # More specific if "All" is not in list
                                     pass
                                 if len(cate_list) > len(cate_list2) > 0:
                                     cate_list = cate_list2
-                        except:
+                        except Exception as e:
+                            if Glb.debug:
+                                print(f"DEBUG: Suppressed error in iptv_user_pass client_area section: {e}")
                             pass
                         fileName = server.split('://')[1].split(':')[0].split('/')[0]
                         my_date = datetime.now().strftime('%b %d, %Y  %I:%M %p')
@@ -1490,9 +1490,8 @@ class Utilities:
 
     def __init__(self):
         import m3u8 as m3u8_
-        import requests as req
         self.m3u8_module = m3u8_
-        self.req = req
+        self.req = requests # Use the top-level import
         self.listHeaders = {'Accept': '*/*', 'Accept-Language': 'de', 'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
                             'Range': 'bytes=0-'}
         self.host = ""
@@ -1541,8 +1540,7 @@ class Utilities:
 class PortScanner:
 
     def __init__(self):
-        import requests as req
-        self.http = req
+        self.http = requests # Use the top-level import
         self.header = {
             "Host": "www.ipfingerprints.com",
             "Connection": "keep-alive",
@@ -1723,6 +1721,8 @@ class ExploitMain:
                                 vulPorts.append(_Port)
                                 break
                     except Exception as e:
+                        if Glb.debug:
+                            print(f"DEBUG: Error during checkHB for {realIp}:{_Port}: {e}")
                         pass
             return vulPorts
 
@@ -2176,8 +2176,13 @@ class StartApp:
                 try:
                     if not os.path.exists(path):
                         os.makedirs(path)
-                except:
-                    False
+                except OSError as e:
+                    print(f"Warning: Could not create directory {path}: {e}")
+                    # Decide if this is fatal or if the program can continue.
+                    # For now, just print a warning. The original code had 'False' here,
+                    # which was likely a placeholder or an incomplete thought.
+                    # Depending on the importance of this directory, we might want to exit.
+                    pass # Or handle more gracefully
 
                 sys.stdout.flush()
                 if InfoCollect().scan_mode() is True:
